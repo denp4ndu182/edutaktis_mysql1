@@ -1,0 +1,21 @@
+# EduTaktis SaaS — Web Server Security Hardening (.htaccess)
+# Apache 2.4 Compatible Security Hardening
+
+# Block direct HTTP access to sensitive configuration files and source code
+<FilesMatch "^(\.env|\.git|prisma\.schema|package\.json|package-lock\.json|tsconfig\.json|metadata\.json|.*\.(env|prisma|sql|ts|tsx|log|sh|md|lock))$">
+    Require all denied
+</FilesMatch>
+
+# Block direct access to internal application directories
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteRule ^(\.git|node_modules|prisma|scripts) - [F,L]
+</IfModule>
+
+# Security Headers
+<IfModule mod_headers.c>
+    Header set X-Content-Type-Options "nosniff"
+    Header set X-Frame-Options "SAMEORIGIN"
+    Header set X-XSS-Protection "1; mode=block"
+    Header set Referrer-Policy "strict-origin-when-cross-origin"
+</IfModule>

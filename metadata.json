@@ -1,0 +1,6 @@
+{
+  "name": "Generator Administrasi Guru KBC AI",
+  "description": "Sistem berbasis AI untuk menyusun dokumen administrasi pembelajaran (ACP, TP, ATP, PROTA, PROSEM, KKTP) berbasis Kurikulum Berbasis Cinta (KBC) dan PPRA terintegrasi siap cetak.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,47 @@
+{
+  "name": "react-example",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx server.ts",
+    "start": "node dist/server.js",
+    "build:server": "esbuild server.ts --bundle --platform=node --target=es2022 --format=esm --outfile=dist/server.js --external:@prisma/client --external:argon2 --external:express --external:dotenv --external:cookie-parser --external:vite",
+    "build": "vite build && npm run build:server",
+    "preview": "vite preview",
+    "clean": "rm -rf dist server.js",
+    "lint": "tsc --noEmit",
+    "bootstrap:super-admin": "tsx scripts/bootstrap-super-admin.ts"
+  },
+  "dependencies": {
+    "@google/genai": "^3.0.0",
+    "@prisma/client": "^6.4.0",
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/cookie-parser": "^1.4.10",
+    "@types/file-saver": "^2.0.7",
+    "@vitejs/plugin-react": "^6.1.1",
+    "argon2": "^0.45.2",
+    "cookie-parser": "^1.4.7",
+    "docx": "^9.15.2",
+    "dotenv": "^17.2.3",
+    "express": "^4.21.2",
+    "file-saver": "^2.0.5",
+    "lucide-react": "^0.546.0",
+    "motion": "^12.23.24",
+    "prisma": "^6.4.0",
+    "react": "^19.0.1",
+    "react-dom": "^19.0.1",
+    "vite": "^8.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "autoprefixer": "^10.4.21",
+    "esbuild": "^0.25.0",
+    "tailwindcss": "^4.3.3",
+    "tsx": "^4.21.0",
+    "typescript": "^7.0.2",
+    "@types/express": "^4.17.21"
+  }
+}

@@ -1,0 +1,129 @@
+@import "tailwindcss";
+
+:root {
+  --color-primary-blue: #087FC1;
+  --color-ocean-blue: #168FCB;
+  --color-soft-cyan: #24BFD0;
+  --color-deep-blue: #075080;
+  --sidebar-gradient: linear-gradient(160deg, #075080 0%, #087FA6 55%, #16A9B9 100%);
+  --page-bg: #EAF5FC;
+  --card-bg: #FFFFFF;
+  --glass-surface: rgba(255, 255, 255, 0.82);
+  --primary-text: #173B57;
+  --secondary-text: #64798B;
+  --border-color: #DCEAF2;
+  --success-color: #159B79;
+  --warning-color: #E9A23B;
+  --danger-color: #DC5656;
+}
+
+@layer base {
+  body {
+    font-family: 'Plus Jakarta Sans', Arial, Calibri, sans-serif;
+    background-color: var(--page-bg);
+    background-image: 
+      linear-gradient(135deg, rgba(255, 255, 255, 0.92) 0%, rgba(234, 245, 252, 0.88) 50%, rgba(220, 238, 250, 0.92) 100%),
+      url('/assets/edutaktis-academic-background.webp'),
+      url('/assets/edutaktis-academic-background.png');
+    background-size: cover;
+    background-position: center;
+    background-attachment: fixed;
+    min-height: 100vh;
+    color: var(--primary-text);
+  }
+}
+
+.glass-surface {
+  background: var(--glass-surface);
+  backdrop-filter: blur(18px) saturate(145%);
+  -webkit-backdrop-filter: blur(18px) saturate(145%);
+  border: 1px solid var(--border-color);
+  box-shadow: 
+    0 12px 35px rgba(7, 80, 128, 0.08),
+    inset 0 1px 0 rgba(255, 255, 255, 0.90);
+}
+
+.sidebar-ocean {
+  background: var(--sidebar-gradient);
+  box-shadow: 4px 0 25px rgba(7, 80, 128, 0.15);
+  border-right: 1px solid rgba(255, 255, 255, 0.25);
+}
+
+/* Premium Table Styling */
+.table-ocean-header {
+  background-color: #DDF3FC;
+  color: var(--color-deep-blue);
+}
+
+.table-row-hover:hover {
+  background-color: #F1F9FC;
+}
+
+/* Print Specific Rules for Clean A4 Output */
+@media print {
+  body {
+    background: white !important;
+    color: black !important;
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+
+  .no-print,
+  header,
+  footer,
+  nav,
+  button,
+  .action-bar {
+    display: none !important;
+  }
+
+  main {
+    max-width: 100% !important;
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+
+  .print-container {
+    box-shadow: none !important;
+    border: none !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    transform: none !important;
+  }
+
+  @page {
+    size: auto;
+    margin: 15mm;
+  }
+
+  table {
+    page-break-inside: auto;
+  }
+
+  tr {
+    page-break-inside: avoid;
+    page-break-after: auto;
+  }
+
+  thead {
+    display: table-header-group;
+  }
+}
+
+/* Animations */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fadeIn {
+  animation: fadeIn 0.25s ease-out forwards;
+}
