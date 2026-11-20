@@ -28,7 +28,7 @@ export class ModulAjarRepository {
   async getAcademicSources(
     projectId: string,
     institutionId: string,
-    userId: string,
+    userId: string | undefined,
     selectedTpCodes?: string[]
   ): Promise<{
     allowed: boolean;
@@ -127,7 +127,7 @@ export class ModulAjarRepository {
   async createModulAjar(
     projectId: string,
     institutionId: string,
-    userId: string,
+    userId: string | undefined,
     input: TeacherGenerationInput,
     initialData?: ModulAjarKbcData,
     options?: { expectedProjectUpdatedAt?: Date | string }
@@ -192,7 +192,7 @@ export class ModulAjarRepository {
     projectId: string,
     documentId: string,
     institutionId: string,
-    userId: string
+    userId: string | undefined
   ): Promise<ModulAjarKbcRecord | null> {
     const project = await projectRepository.findProjectByIdAndInstitution(projectId, institutionId, userId);
     if (!project) return null;
@@ -205,7 +205,7 @@ export class ModulAjarRepository {
   async listModulAjar(
     projectId: string,
     institutionId: string,
-    userId: string,
+    userId: string | undefined,
     limit = 50,
     offset = 0
   ): Promise<{ items: ModulAjarKbcRecord[]; total: number }> {
@@ -229,7 +229,7 @@ export class ModulAjarRepository {
     projectId: string,
     documentId: string,
     institutionId: string,
-    userId: string,
+    userId: string | undefined,
     data: {
       title?: string;
       content?: ModulAjarKbcData;
@@ -305,7 +305,7 @@ export class ModulAjarRepository {
   async createLkpd(
     projectId: string,
     institutionId: string,
-    userId: string,
+    userId: string | undefined,
     input: {
       mode: 'FROM_MODULE' | 'FROM_ACADEMIC_DATA';
       sourceModuleId?: string;
@@ -394,7 +394,7 @@ export class ModulAjarRepository {
     projectId: string,
     documentId: string,
     institutionId: string,
-    userId: string
+    userId: string | undefined
   ): Promise<LkpdRecord | null> {
     const project = await projectRepository.findProjectByIdAndInstitution(projectId, institutionId, userId);
     if (!project) return null;
@@ -407,7 +407,7 @@ export class ModulAjarRepository {
   async listLkpd(
     projectId: string,
     institutionId: string,
-    userId: string,
+    userId: string | undefined,
     limit = 50,
     offset = 0
   ): Promise<{ items: LkpdRecord[]; total: number }> {
@@ -431,7 +431,7 @@ export class ModulAjarRepository {
     projectId: string,
     documentId: string,
     institutionId: string,
-    userId: string,
+    userId: string | undefined,
     data: {
       title?: string;
       content?: LkpdData;

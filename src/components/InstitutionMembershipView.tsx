@@ -49,6 +49,91 @@ export const InstitutionMembershipView: React.FC<InstitutionMembershipViewProps>
     }
   };
 
+  if (!currentMembership || !currentInstitution) {
+    return (
+      <div className="max-w-7xl mx-auto pb-16 space-y-6">
+        <div className="glass-surface rounded-3xl border border-white/60 p-8 shadow-md">
+          <div className="flex items-start gap-4">
+            <div className="w-14 h-14 rounded-2xl bg-amber-100 text-amber-700 flex items-center justify-center shrink-0">
+              <AlertCircle className="w-7 h-7" />
+            </div>
+            <div>
+              <h2 className="text-lg font-black text-[#173B57]">
+                {userInstitutions.length > 0
+                  ? 'Pilih Institusi Aktif'
+                  : 'Belum Memiliki Keanggotaan Aktif'}
+              </h2>
+              <p className="text-sm text-[#64798B] mt-2 leading-relaxed">
+                {userInstitutions.length > 0
+                  ? 'Sesi akun Anda masih valid, tetapi institusi yang tersimpan tidak lagi dapat digunakan. Pilih salah satu institusi dengan keanggotaan aktif di bawah ini.'
+                  : 'Akun Anda sudah aktif, tetapi belum memiliki keanggotaan institusi dengan status ACTIVE. Hubungi administrator untuk mendapatkan penetapan keanggotaan.'}
+              </p>
+              <p className="text-xs text-[#64798B] mt-3">
+                Pengguna: {currentUser.namaLengkap} ({currentUser.email})
+              </p>
+            </div>
+          </div>
+        </div>
+
+        {userInstitutions.length > 0 && (
+          <div className="glass-surface rounded-3xl border border-white/60 p-8 shadow-md space-y-5">
+            <div>
+              <h3 className="text-sm font-black text-[#173B57] uppercase tracking-wider">
+                Institusi dengan Keanggotaan Aktif
+              </h3>
+              <p className="text-xs text-[#64798B] mt-1">
+                Pilih institusi. Server akan memverifikasi keanggotaan sebelum konteks diubah.
+              </p>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+              {userInstitutions.map(({ institution, membership }) => {
+                const roleBadge = getRoleBadge(membership.role);
+
+                return (
+                  <div
+                    key={institution.id}
+                    className="p-6 rounded-3xl border border-[#DCEAF2] bg-white/80"
+                  >
+                    <div className="flex items-start justify-between gap-4">
+                      <div>
+                        <h4 className="text-sm font-black text-[#173B57]">
+                          {institution.namaSingkat || institution.namaResmi}
+                        </h4>
+                        <p className="text-xs text-[#64798B] mt-2">
+                          {institution.namaResmi}
+                        </p>
+                        <p className="text-[11px] text-[#64798B] mt-1">
+                          NPSN: {institution.npsn} • {institution.kabupatenKota}
+                        </p>
+                      </div>
+                      <span className={`text-[10px] font-black px-3 py-1 rounded-full border shrink-0 ${roleBadge.color}`}>
+                        {roleBadge.label}
+                      </span>
+                    </div>
+
+                    <div className="mt-5 pt-4 border-t border-[#DCEAF2] flex items-center justify-between">
+                      <span className="text-[10px] font-bold text-emerald-700">
+                        MEMBERSHIP ACTIVE
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => onSwitchActiveInstitution(institution.id)}
+                        className="px-5 py-2.5 rounded-xl text-[11px] font-black bg-gradient-to-r from-[#075080] to-[#087FC1] text-white hover:from-[#087FC1] hover:to-[#075080] transition-all cursor-pointer shadow-md"
+                      >
+                        PILIH INSTITUSI
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
   const activeRoleBadge = getRoleBadge(currentMembership.role);
 
   return (

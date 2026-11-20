@@ -8,7 +8,7 @@
 
 ## Build & Production Runtime Configuration
  Production **TIDAK BUKAN** mengeksekusi `tsx server.ts` (mencegah Out-Of-Memory/OOM pada shared hosting).
- Proyek dikompilasi menggunakan bundler `esbuild` dengan `--target=es2022` menjadi JavaScript murni `dist/server.js`.
+ Proyek dikompilasi menggunakan bundler `esbuild` dengan `--target=es2022` menjadi JavaScript murni `server.js`.
 
 ### Build Commands:
 ```bash
@@ -17,7 +17,7 @@ npm run build
 
 # Artifacts Produced:
 # - dist/index.html & dist/assets/* (React SPA)
-# - dist/server.js (Express Backend JS Bundle)
+# - server.js (Express Backend JS Bundle)
 ```
 
 ### cPanel Node.js Application Setup:
@@ -25,7 +25,7 @@ npm run build
 2. **Application Mode:** `Production`
 3. **Application Root:** `app.edutaktis.com`
 4. **Application URL:** `app.edutaktis.com`
-5. **Application Startup File:** `dist/server.js`
+5. **Application Startup File:** `server.js`
 6. **Environment Variables:**
    - `NODE_ENV="production"`
    - `PORT="3000"` (atau disesuaikan oleh Phusion Passenger)

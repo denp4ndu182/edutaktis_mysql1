@@ -122,9 +122,16 @@ export async function requireInstitutionMembership(
     }
 
     if (activeMem.membership.status !== 'ACTIVE') {
+      const membershipStatus = activeMem.membership.status;
+
+      const errorMessage =
+        membershipStatus === 'PENDING'
+          ? 'Akses ditolak: Keanggotaan Anda masih menunggu persetujuan administrator madrasah.'
+          : 'Akses ditolak: Keanggotaan Anda di institusi ini tidak aktif. Silakan hubungi administrator madrasah.';
+
       return res.status(403).json({
         success: false,
-        error: `Akses ditolak: Keanggotaan Anda di institusi ini berstatus '${activeMem.membership.status}' dan belum disetujui oleh administrator madrasah.`,
+        error: errorMessage,
         code: 'MEMBERSHIP_PENDING',
       });
     }
@@ -260,20 +267,28 @@ export async function requireSuperAdmin(
   }
 
   try {
-    let isSuperAdmin = false;
-    const { prisma } = await import('../db/prisma.js');
-    if (process.env.DATABASE_URL) {
-      const superMem = await prisma.institutionMembership.findFirst({
-        where: {
-          userId: req.user.id,
-          role: 'SUPER_ADMIN',
-          status: 'ACTIVE',
-        },
+    if (!process.env.DATABASE_URL) {
+      return res.status(503).json({
+        success: false,
+        error: 'Layanan otorisasi Super Admin tidak tersedia karena database belum dikonfigurasi.',
+        code: 'AUTHORIZATION_DATABASE_UNAVAILABLE',
       });
-      if (superMem) isSuperAdmin = true;
-    } else {
-      isSuperAdmin = req.user.email.includes('superadmin') || req.user.email.includes('pandu');
     }
+
+    const { prisma } = await import('../db/prisma.js');
+    const superMem = await prisma.institutionMembership.findFirst({
+      where: {
+        userId: req.user.id,
+        role: 'SUPER_ADMIN',
+        status: 'ACTIVE',
+        user: {
+          isActive: true,
+        },
+      },
+      select: { id: true },
+    });
+
+    const isSuperAdmin = Boolean(superMem);
 
     if (!isSuperAdmin) {
       await auditLogRepository.logAction({

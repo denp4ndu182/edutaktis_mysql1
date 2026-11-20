@@ -337,6 +337,18 @@ export function setActiveInstitutionId(institutionId: string): void {
   }
 }
 
+// Read the persisted institution ID without applying local membership fallback.
+// The backend remains responsible for validating active membership.
+export function getStoredActiveInstitutionId(): string | null {
+  try {
+    const stored = localStorage.getItem(STORAGE_KEY_ACTIVE_INSTITUTION_ID);
+    return stored && stored.trim() ? stored : null;
+  } catch (e) {
+    console.error('Failed reading stored active institution id:', e);
+    return null;
+  }
+}
+
 // Role Authorization Check
 export function canEditInstitution(role: InstitutionRole): boolean {
   return role === 'SUPER_ADMIN' || role === 'SCHOOL_ADMIN' || role === 'HEADMASTER';
@@ -377,21 +389,14 @@ export function getTenantContext(): TenantContext {
   const activeInstitutionId = getActiveInstitutionId();
   const userMemberships = getUserMemberships(currentUser.id);
 
-  let currentMembership = userMemberships.find((m) => m.institutionId === activeInstitutionId);
-  if (!currentMembership) {
-    currentMembership = userMemberships[0] || {
-      id: `mem_auto_${currentUser.id}`,
-      userId: currentUser.id,
-      institutionId: activeInstitutionId,
-      role: 'TEACHER',
-      status: 'ACTIVE',
-      joinedAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-  }
+  const currentMembership =
+    userMemberships.find((m) => m.institutionId === activeInstitutionId) ||
+    userMemberships[0] ||
+    null;
 
-  const currentInstitution =
-    getInstitutionById(currentMembership.institutionId) || SEED_INSTITUTIONS[0];
+  const currentInstitution = currentMembership
+    ? getInstitutionById(currentMembership.institutionId) || null
+    : null;
 
   const userInstitutions = userMemberships
     .map((mem) => {
@@ -432,25 +437,32 @@ export function switchActiveUser(userId: string): TenantContext {
 export function syncMasterInputWithTenant(
   currentInput: MasterInputData,
   user: UserProfile,
-  institution: InstitutionProfile
+  institution: InstitutionProfile | null
 ): MasterInputData {
   const formattedTeacherName = formatFullTeacherName(user);
 
   return {
     ...currentInput,
-    // School identity from Institution Profile
-    kemenagOrYayasan: institution.kementerianDinas || currentInput.kemenagOrYayasan,
-    namaMadrasah: institution.namaResmi || institution.namaSingkat || currentInput.namaMadrasah,
-    alamatMadrasah: institution.alamatLengkap
+
+    // School identity: preserve existing values when no institution is linked.
+    kemenagOrYayasan:
+      institution?.kementerianDinas || currentInput.kemenagOrYayasan,
+    namaMadrasah:
+      institution?.namaResmi ||
+      institution?.namaSingkat ||
+      currentInput.namaMadrasah,
+    alamatMadrasah: institution?.alamatLengkap
       ? `${institution.alamatLengkap}, ${institution.kelurahanDesa}, ${institution.kecamatan}, ${institution.kabupatenKota}`
       : currentInput.alamatMadrasah,
-    namaKepala: institution.namaKepala || currentInput.namaKepala,
-    nipKepala: institution.nipKepala || currentInput.nipKepala,
-    kotaTandaTangan: institution.kotaTandaTangan || currentInput.kotaTandaTangan,
+    namaKepala: institution?.namaKepala || currentInput.namaKepala,
+    nipKepala: institution?.nipKepala || currentInput.nipKepala,
+    kotaTandaTangan:
+      institution?.kotaTandaTangan || currentInput.kotaTandaTangan,
 
-    // Teacher identity from User Profile
+    // Teacher identity remains synchronized independently.
     namaGuru: formattedTeacherName || currentInput.namaGuru,
     nipGuru: user.nip || currentInput.nipGuru,
-    mataPelajaran: user.preferensiMataPelajaran || currentInput.mataPelajaran,
+    mataPelajaran:
+      user.preferensiMataPelajaran || currentInput.mataPelajaran,
   };
 }

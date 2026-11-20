@@ -1,4 +1,5 @@
 import { TenantContext } from '../types';
+import { getStoredActiveInstitutionId } from './tenantService';
 
 export interface AuthUser {
   id: string;
@@ -27,18 +28,25 @@ let cachedCsrfToken: string | null = null;
 /**
  * Fetch or retrieve cached CSRF token
  */
-export async function getCsrfToken(): Promise<string> {
+export async function getCsrfToken(forceRefresh = false): Promise<string> {
+  if (forceRefresh) {
+    cachedCsrfToken = null;
+  }
+
   if (cachedCsrfToken) return cachedCsrfToken;
+
   try {
     const res = await fetch('/api/auth/csrf', { credentials: 'include' });
     const data = await res.json();
-    if (data.success && data.csrfToken) {
+
+    if (res.ok && data.success && data.csrfToken) {
       cachedCsrfToken = data.csrfToken;
       return cachedCsrfToken as string;
     }
   } catch (e) {
     console.warn('Failed fetching CSRF token:', e);
   }
+
   return '';
 }
 
@@ -62,18 +70,43 @@ export async function secureFetch(
     headers.set('X-Institution-Id', activeInstitutionId);
   }
 
-  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
-    const csrf = await getCsrfToken();
-    if (csrf) {
-      headers.set('X-CSRF-Token', csrf);
-    }
-  }
+  const requiresCsrf = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(method);
 
-  return fetch(endpoint, {
+  const sendRequest = () => fetch(endpoint, {
     ...options,
     headers,
     credentials: 'include', // Ensures HttpOnly cookie is attached
   });
+
+  if (!requiresCsrf) {
+    return sendRequest();
+  }
+
+  const csrf = await getCsrfToken();
+  if (csrf) {
+    headers.set('X-CSRF-Token', csrf);
+  }
+
+  let response = await sendRequest();
+
+  if (response.status === 403) {
+    const responseData = await response.clone().json().catch(() => null);
+    const recoverableCsrfErrors = [
+      'CSRF_TOKEN_MISSING',
+      'CSRF_SIGNATURE_INVALID',
+    ];
+
+    if (recoverableCsrfErrors.includes(responseData?.code)) {
+      const refreshedCsrf = await getCsrfToken(true);
+
+      if (refreshedCsrf) {
+        headers.set('X-CSRF-Token', refreshedCsrf);
+        response = await sendRequest();
+      }
+    }
+  }
+
+  return response;
 }
 
 /**
@@ -81,7 +114,12 @@ export async function secureFetch(
  */
 export async function getCurrentSession(): Promise<SessionResponse> {
   try {
-    const res = await secureFetch('/api/auth/me');
+    const activeInstitutionId = getStoredActiveInstitutionId();
+    const res = await secureFetch(
+      '/api/auth/me',
+      {},
+      activeInstitutionId || undefined
+    );
     if (res.status === 401) {
       return { success: false, code: 'UNAUTHENTICATED' };
     }
@@ -184,6 +222,28 @@ export async function requestPasswordReset(email: string): Promise<{ success: bo
     return await res.json();
   } catch (err: any) {
     return { success: false, message: err.message || 'Gagal memproses reset password' };
+  }
+}
+
+
+/**
+ * Complete password reset using a one-time email token.
+ */
+export async function resetPassword(
+  token: string,
+  newPassword: string
+): Promise<{ success: boolean; message?: string; error?: string; retryAfterSeconds?: number }> {
+  try {
+    const res = await secureFetch('/api/auth/reset-password', {
+      method: 'POST',
+      body: JSON.stringify({ token, newPassword }),
+    });
+    return await res.json();
+  } catch (err: any) {
+    return {
+      success: false,
+      error: err.message || 'Gagal menghubungi server autentikasi.',
+    };
   }
 }
 

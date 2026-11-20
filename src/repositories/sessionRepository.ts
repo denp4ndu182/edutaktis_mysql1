@@ -2,10 +2,6 @@ import { prisma } from '../db/prisma';
 import { UserSession } from '@prisma/client';
 
 export class SessionRepository {
-  private get isDbConfigured(): boolean {
-    return Boolean(process.env.DATABASE_URL);
-  }
-
   /**
    * Create a new session in database.
    */
@@ -16,20 +12,6 @@ export class SessionRepository {
     ipAddress?: string;
     userAgent?: string;
   }): Promise<UserSession> {
-    if (!this.isDbConfigured) {
-      return {
-        id: `sess_mem_${Date.now()}`,
-        userId: data.userId,
-        tokenHash: data.tokenHash,
-        expiresAt: data.expiresAt,
-        revokedAt: null,
-        ipAddress: data.ipAddress || null,
-        userAgent: data.userAgent || null,
-        lastUsedAt: new Date(),
-        createdAt: new Date(),
-      };
-    }
-
     return prisma.userSession.create({
       data: {
         userId: data.userId,
@@ -43,6 +25,8 @@ export class SessionRepository {
 
   /**
    * Finds an active, non-revoked, non-expired session by token hash.
+   * Returns null only when the session is genuinely invalid or absent.
+   * Database errors are propagated to the caller.
    */
   async findValidSession(tokenHash: string): Promise<
     (UserSession & {
@@ -59,123 +43,107 @@ export class SessionRepository {
       };
     }) | null
   > {
-    if (!this.isDbConfigured) return null;
-
-    try {
-      const session = await prisma.userSession.findUnique({
-        where: { tokenHash },
-        include: {
-          user: {
-            select: {
-              id: true,
-              email: true,
-              namaLengkap: true,
-              gelarDepan: true,
-              gelarBelakang: true,
-              nip: true,
-              nuptk: true,
-              isActive: true,
-              fotoProfilUrl: true,
-            },
+    const session = await prisma.userSession.findUnique({
+      where: { tokenHash },
+      include: {
+        user: {
+          select: {
+            id: true,
+            email: true,
+            namaLengkap: true,
+            gelarDepan: true,
+            gelarBelakang: true,
+            nip: true,
+            nuptk: true,
+            isActive: true,
+            fotoProfilUrl: true,
           },
         },
-      });
+      },
+    });
 
-      if (!session) return null;
-      if (session.revokedAt) return null;
-      if (new Date() > session.expiresAt) return null;
-      if (!session.user.isActive) return null;
+    if (!session) return null;
+    if (session.revokedAt) return null;
+    if (new Date() > session.expiresAt) return null;
+    if (!session.user.isActive) return null;
 
-      return session;
-    } catch (err) {
-      return null;
-    }
+    return session;
   }
 
   /**
    * Updates lastUsedAt timestamp.
+   * Best-effort operation: failures are logged, not silently discarded.
    */
   async updateLastUsed(id: string): Promise<void> {
-    if (!this.isDbConfigured) return;
     try {
       await prisma.userSession.update({
         where: { id },
         data: { lastUsedAt: new Date() },
       });
-    } catch {
-      // Non-blocking update failure
+    } catch (err) {
+      console.error('Session last-used update failed:', err);
     }
   }
 
   /**
    * Revoke a specific session by token hash.
+   * Database errors are propagated to the caller.
    */
   async revokeByTokenHash(tokenHash: string): Promise<void> {
-    if (!this.isDbConfigured) return;
-    try {
-      await prisma.userSession.updateMany({
-        where: { tokenHash, revokedAt: null },
-        data: { revokedAt: new Date() },
-      });
-    } catch {
-      // Non-blocking
-    }
+    await prisma.userSession.updateMany({
+      where: { tokenHash, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
   }
 
   /**
    * Revoke all sessions for a user (logout all devices).
+   * Database errors are propagated to the caller.
    */
   async revokeAllUserSessions(userId: string): Promise<number> {
-    if (!this.isDbConfigured) return 0;
-    try {
-      const res = await prisma.userSession.updateMany({
-        where: { userId, revokedAt: null },
-        data: { revokedAt: new Date() },
-      });
-      return res.count;
-    } catch {
-      return 0;
-    }
+    const res = await prisma.userSession.updateMany({
+      where: { userId, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+
+    return res.count;
   }
 
   /**
    * List active sessions for user.
+   * Database errors are propagated to the caller.
    */
   async listActiveSessions(userId: string): Promise<UserSession[]> {
-    if (!this.isDbConfigured) return [];
-    try {
-      return await prisma.userSession.findMany({
-        where: {
-          userId,
-          revokedAt: null,
-          expiresAt: { gt: new Date() },
-        },
-        orderBy: { lastUsedAt: 'desc' },
-      });
-    } catch {
-      return [];
-    }
+    return prisma.userSession.findMany({
+      where: {
+        userId,
+        revokedAt: null,
+        expiresAt: { gt: new Date() },
+      },
+      orderBy: { lastUsedAt: 'desc' },
+    });
   }
 
   /**
-   * Cleans up expired or revoked sessions older than 30 days to prevent table bloat.
+   * Cleans up expired or revoked sessions older than 30 days.
+   * Database errors are propagated to the caller.
    */
   async cleanupExpiredSessions(retentionDays = 30): Promise<number> {
-    if (!this.isDbConfigured) return 0;
-    try {
-      const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
-      const res = await prisma.userSession.deleteMany({
-        where: {
-          OR: [
-            { expiresAt: { lt: cutoff } },
-            { revokedAt: { not: null, lt: cutoff } },
-          ],
-        },
-      });
-      return res.count;
-    } catch {
-      return 0;
+    if (!Number.isFinite(retentionDays) || retentionDays < 0) {
+      throw new Error('retentionDays must be a non-negative finite number.');
     }
+
+    const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
+    const res = await prisma.userSession.deleteMany({
+      where: {
+        OR: [
+          { expiresAt: { lt: cutoff } },
+          { revokedAt: { not: null, lt: cutoff } },
+        ],
+      },
+    });
+
+    return res.count;
   }
 }
 

@@ -26,7 +26,7 @@ Panduan ini menjelaskan prosedur eksekusi dan verifikasi migrasi database MariaD
 3. **Pengujian MariaDB Live (Jika DATABASE_URL Server Live Tersedia):**
    - `npx tsx scripts/test-phase3d.ts` (Menguji pendaftaran, transaksi, presisi waktu, JSON Unicode, dan pengujian Composite Foreign Key Positif & Negatif)
 4. **Pengujian Runtime cPanel:**
-   - Menjalankan `node dist/server.js` pada lingkungan Phusion Passenger Rumahweb.
+   - Menjalankan `node server.js` pada lingkungan Phusion Passenger Rumahweb.
 
 ## Production Migration Steps (cPanel phpMyAdmin / MySQL CLI)
 1. Buat basis data MySQL di cPanel (*MySQL Databases*):

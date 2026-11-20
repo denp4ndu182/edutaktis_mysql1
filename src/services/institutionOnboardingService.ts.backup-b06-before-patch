@@ -1,0 +1,341 @@
+import {
+  InstitutionRequest,
+  InstitutionRequestStatus,
+  InstitutionRole,
+  MembershipStatus,
+} from '@prisma/client';
+
+import { institutionRequestRepository } from '../repositories/institutionRequestRepository';
+import { membershipRepository } from '../repositories/membershipRepository';
+import { auditLogRepository } from '../repositories/auditLogRepository';
+import { withOnboardingTransaction } from '../security/onboardingTransaction';
+
+export interface SubmitInstitutionRequestInput {
+  requesterUserId: string;
+  npsn: string;
+  namaResmi: string;
+  namaSingkat: string;
+  jenjang: string;
+  jenisInstitusi: string;
+  kementerianDinas: string;
+  alamatLengkap: string;
+  kelurahanDesa?: string | null;
+  kecamatan?: string | null;
+  kabupatenKota: string;
+  provinsi: string;
+  kodePos?: string | null;
+  telepon?: string | null;
+  email?: string | null;
+  website?: string | null;
+  ipAddress?: string;
+}
+
+export interface InstitutionRequestListInput {
+  take?: number;
+  skip?: number;
+}
+
+export interface ReviewInstitutionRequestInput {
+  requestId: string;
+  reviewerUserId: string;
+  ipAddress?: string;
+}
+
+export interface RejectInstitutionRequestInput
+  extends ReviewInstitutionRequestInput {
+  rejectionReason: string;
+}
+
+function requiredText(value: string, field: string, max: number): string {
+  const result = value.trim();
+  if (!result) throw new Error(`VALIDATION_ERROR: ${field} wajib diisi.`);
+  if (result.length > max) {
+    throw new Error(`VALIDATION_ERROR: ${field} melebihi ${max} karakter.`);
+  }
+  return result;
+}
+
+function optionalText(value?: string | null): string | null {
+  return value?.trim() || null;
+}
+
+function assertPending(
+  request: InstitutionRequest | null
+): InstitutionRequest {
+  if (!request) throw new Error('INSTITUTION_REQUEST_NOT_FOUND');
+  if (request.status !== InstitutionRequestStatus.PENDING_REVIEW) {
+    throw new Error('INSTITUTION_REQUEST_NOT_PENDING');
+  }
+  return request;
+}
+
+export class InstitutionOnboardingService {
+  async submitRequest(
+    input: SubmitInstitutionRequestInput
+  ): Promise<InstitutionRequest> {
+    const requesterUserId = requiredText(input.requesterUserId, 'User ID', 36);
+
+    const data = {
+      npsn: requiredText(input.npsn, 'NPSN', 20),
+      namaResmi: requiredText(input.namaResmi, 'Nama resmi', 255),
+      namaSingkat: requiredText(input.namaSingkat, 'Nama singkat', 100),
+      jenjang: requiredText(input.jenjang, 'Jenjang', 20),
+      jenisInstitusi: requiredText(input.jenisInstitusi, 'Jenis institusi', 20),
+      kementerianDinas: requiredText(input.kementerianDinas, 'Kementerian/dinas', 255),
+      alamatLengkap: requiredText(input.alamatLengkap, 'Alamat', 10000),
+      kelurahanDesa: optionalText(input.kelurahanDesa),
+      kecamatan: optionalText(input.kecamatan),
+      kabupatenKota: requiredText(input.kabupatenKota, 'Kabupaten/kota', 100),
+      provinsi: requiredText(input.provinsi, 'Provinsi', 100),
+      kodePos: optionalText(input.kodePos),
+      telepon: optionalText(input.telepon),
+      email: optionalText(input.email),
+      website: optionalText(input.website),
+    };
+
+    return withOnboardingTransaction(async (tx) => {
+      const user = await tx.user.findUnique({
+        where: { id: requesterUserId },
+        select: { id: true, isActive: true },
+      });
+      if (!user?.isActive) throw new Error('REQUESTER_NOT_ACTIVE');
+
+      const institution = await tx.institution.findUnique({
+        where: { npsn: data.npsn },
+        select: { id: true },
+      });
+      if (institution) throw new Error('NPSN_ALREADY_REGISTERED');
+
+      const pending = await institutionRequestRepository.findPendingByNpsn(
+        data.npsn, tx
+      );
+      if (pending) throw new Error('NPSN_REQUEST_ALREADY_PENDING');
+
+      const created = await institutionRequestRepository.create(tx, {
+        ...data,
+        requester: { connect: { id: requesterUserId } },
+      });
+
+      await auditLogRepository.createInTransaction(tx, {
+        userId: requesterUserId,
+        action: 'INSTITUTION_REQUEST_SUBMITTED',
+        resource: 'InstitutionRequest',
+        details: {
+          requestId: created.id,
+          npsn: created.npsn,
+          status: created.status,
+        },
+        ipAddress: input.ipAddress,
+      });
+
+      return created;
+    });
+  }
+
+  async getMyRequests(
+    userId: string,
+    params: InstitutionRequestListInput = {}
+  ): Promise<InstitutionRequest[]> {
+    if (!userId.trim()) throw new Error('VALIDATION_ERROR: userId wajib diisi.');
+    return institutionRequestRepository.listByRequester(
+      userId, params.take, params.skip
+    );
+  }
+
+  async listPendingRequests(
+    params: InstitutionRequestListInput = {}
+  ): Promise<InstitutionRequest[]> {
+    return institutionRequestRepository.listPending(
+      params.take, params.skip
+    );
+  }
+
+  async getRequestDetail(id: string): Promise<InstitutionRequest> {
+    if (!id.trim()) throw new Error('VALIDATION_ERROR: requestId wajib diisi.');
+    const request = await institutionRequestRepository.findById(id);
+    if (!request) throw new Error('INSTITUTION_REQUEST_NOT_FOUND');
+    return request;
+  }
+
+  async cancelRequest(
+    requestId: string,
+    requesterUserId: string,
+    ipAddress?: string
+  ): Promise<InstitutionRequest> {
+    if (!requestId.trim() || !requesterUserId.trim()) {
+      throw new Error('VALIDATION_ERROR: ID pengajuan dan pemohon wajib diisi.');
+    }
+
+    return withOnboardingTransaction(async (tx) => {
+      const request = assertPending(
+        await institutionRequestRepository.findById(requestId, tx)
+      );
+
+      if (request.requesterUserId !== requesterUserId) {
+        throw new Error('INSTITUTION_REQUEST_FORBIDDEN');
+      }
+
+      const count = await institutionRequestRepository.transitionStatus(
+        tx, requestId, InstitutionRequestStatus.PENDING_REVIEW,
+        { status: InstitutionRequestStatus.CANCELLED }
+      );
+      if (count !== 1) throw new Error('INSTITUTION_REQUEST_STATE_CONFLICT');
+
+      await auditLogRepository.createInTransaction(tx, {
+        userId: requesterUserId,
+        action: 'INSTITUTION_REQUEST_CANCELLED',
+        resource: 'InstitutionRequest',
+        details: { requestId },
+        ipAddress,
+      });
+
+      const updated = await institutionRequestRepository.findById(requestId, tx);
+      if (!updated) throw new Error('INSTITUTION_REQUEST_NOT_FOUND_AFTER_UPDATE');
+      return updated;
+    });
+  }
+
+  async approveRequest(
+    input: ReviewInstitutionRequestInput
+  ): Promise<InstitutionRequest> {
+    if (!input.requestId.trim() || !input.reviewerUserId.trim()) {
+      throw new Error('VALIDATION_ERROR: ID pengajuan dan reviewer wajib diisi.');
+    }
+
+    return withOnboardingTransaction(async (tx) => {
+      const request = assertPending(
+        await institutionRequestRepository.findById(input.requestId, tx)
+      );
+
+      const reviewer = await tx.user.findUnique({
+        where: { id: input.reviewerUserId },
+        select: { id: true, isActive: true },
+      });
+      if (!reviewer?.isActive) throw new Error('REVIEWER_NOT_ACTIVE');
+
+      const requester = await tx.user.findUnique({
+        where: { id: request.requesterUserId },
+        select: { id: true, isActive: true },
+      });
+      if (!requester?.isActive) throw new Error('REQUESTER_NOT_ACTIVE');
+
+      const existing = await tx.institution.findUnique({
+        where: { npsn: request.npsn },
+        select: { id: true },
+      });
+      if (existing) throw new Error('NPSN_ALREADY_REGISTERED');
+
+      const institution = await tx.institution.create({
+        data: {
+          npsn: request.npsn,
+          namaResmi: request.namaResmi,
+          namaSingkat: request.namaSingkat,
+          jenjang: request.jenjang,
+          jenisInstitusi: request.jenisInstitusi,
+          kementerianDinas: request.kementerianDinas,
+          alamatLengkap: request.alamatLengkap,
+          kelurahanDesa: request.kelurahanDesa,
+          kecamatan: request.kecamatan,
+          kabupatenKota: request.kabupatenKota,
+          provinsi: request.provinsi,
+          kodePos: request.kodePos,
+          telepon: request.telepon,
+          email: request.email,
+          website: request.website,
+        },
+      });
+
+      await membershipRepository.create({
+        user: { connect: { id: request.requesterUserId } },
+        institution: { connect: { id: institution.id } },
+        role: InstitutionRole.SCHOOL_ADMIN,
+        status: MembershipStatus.ACTIVE,
+      }, tx);
+
+      const count = await institutionRequestRepository.transitionStatus(
+        tx, request.id, InstitutionRequestStatus.PENDING_REVIEW,
+        {
+          status: InstitutionRequestStatus.APPROVED,
+          institutionId: institution.id,
+          reviewedBy: input.reviewerUserId,
+          reviewedAt: new Date(),
+        }
+      );
+      if (count !== 1) throw new Error('INSTITUTION_REQUEST_STATE_CONFLICT');
+
+      await auditLogRepository.createInTransaction(tx, {
+        userId: input.reviewerUserId,
+        institutionId: institution.id,
+        action: 'INSTITUTION_REQUEST_APPROVED',
+        resource: 'InstitutionRequest',
+        details: {
+          requestId: request.id,
+          institutionId: institution.id,
+          requesterUserId: request.requesterUserId,
+          npsn: institution.npsn,
+          assignedRole: InstitutionRole.SCHOOL_ADMIN,
+        },
+        ipAddress: input.ipAddress,
+      });
+
+      const updated = await institutionRequestRepository.findById(
+        request.id, tx
+      );
+      if (!updated) throw new Error('INSTITUTION_REQUEST_NOT_FOUND_AFTER_APPROVAL');
+      return updated;
+    });
+  }
+
+  async rejectRequest(
+    input: RejectInstitutionRequestInput
+  ): Promise<InstitutionRequest> {
+    const reason = requiredText(input.rejectionReason, 'Alasan penolakan', 5000);
+
+    if (!input.requestId.trim() || !input.reviewerUserId.trim()) {
+      throw new Error('VALIDATION_ERROR: ID pengajuan dan reviewer wajib diisi.');
+    }
+
+    return withOnboardingTransaction(async (tx) => {
+      const request = assertPending(
+        await institutionRequestRepository.findById(input.requestId, tx)
+      );
+
+      const reviewer = await tx.user.findUnique({
+        where: { id: input.reviewerUserId },
+        select: { id: true, isActive: true },
+      });
+      if (!reviewer?.isActive) throw new Error('REVIEWER_NOT_ACTIVE');
+
+      const count = await institutionRequestRepository.transitionStatus(
+        tx, request.id, InstitutionRequestStatus.PENDING_REVIEW,
+        {
+          status: InstitutionRequestStatus.REJECTED,
+          reviewedBy: input.reviewerUserId,
+          reviewedAt: new Date(),
+          rejectionReason: reason,
+        }
+      );
+      if (count !== 1) throw new Error('INSTITUTION_REQUEST_STATE_CONFLICT');
+
+      await auditLogRepository.createInTransaction(tx, {
+        userId: input.reviewerUserId,
+        action: 'INSTITUTION_REQUEST_REJECTED',
+        resource: 'InstitutionRequest',
+        details: {
+          requestId: request.id,
+          npsn: request.npsn,
+        },
+        ipAddress: input.ipAddress,
+      });
+
+      const updated = await institutionRequestRepository.findById(
+        request.id, tx
+      );
+      if (!updated) throw new Error('INSTITUTION_REQUEST_NOT_FOUND_AFTER_REJECTION');
+      return updated;
+    });
+  }
+}
+
+export const institutionOnboardingService =
+  new InstitutionOnboardingService();

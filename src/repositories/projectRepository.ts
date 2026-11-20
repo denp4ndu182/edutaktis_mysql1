@@ -350,70 +350,123 @@ export class ProjectRepository {
     },
     userId?: string
   ): Promise<Project> {
-    // 1. Validate payload size
     if (data.masterInput || data.documents) {
-      const payloadStr = JSON.stringify({ masterInput: data.masterInput, documents: data.documents });
+      const payloadStr = JSON.stringify({
+        masterInput: data.masterInput,
+        documents: data.documents,
+      });
+
       if (payloadStr.length > 10 * 1024 * 1024) {
-        throw new Error('Ukuran data pembaruan proyek melebihi batas maksimum 10MB.');
+        throw new Error(
+          'Ukuran data pembaruan proyek melebihi batas maksimum 10MB.'
+        );
       }
     }
 
     if (data.name !== undefined) {
       const trimmedName = data.name.trim();
+
       if (trimmedName.length < 1 || trimmedName.length > 255) {
-        throw new Error('Nama proyek tidak boleh kosong dan maksimal 255 karakter.');
+        throw new Error(
+          'Nama proyek tidak boleh kosong dan maksimal 255 karakter.'
+        );
       }
+
       data.name = trimmedName;
     }
 
     if (this.isDbConfigured) {
-      // Direct scoped lookup prevents IDOR
-      const existing = await prisma.project.findFirst({
-        where: {
-          id,
-          institutionId,
-          ...(userId ? { userId } : {}),
-        },
-      });
+      const scopedWhere = {
+        id,
+        institutionId,
+        ...(userId ? { userId } : {}),
+      };
 
-      if (!existing) {
-        throw new Error(`Proyek tidak ditemukan atau akses ditolak untuk ID: ${id}`);
-      }
+      const updateData = {
+        ...(data.name ? { name: data.name } : {}),
+        ...(data.masterInput ? { masterInput: data.masterInput } : {}),
+        ...(data.documents ? { documents: data.documents } : {}),
+      };
 
-      // Optimistic Concurrency Control (OCC) Check
+      let expectedUpdatedAt: Date | undefined;
+
       if (data.expectedProjectUpdatedAt) {
-        const expectedTime = new Date(data.expectedProjectUpdatedAt).getTime();
-        const actualTime = new Date(existing.updatedAt).getTime();
-        if (expectedTime !== actualTime) {
-          const err = new Error(
-            'OCC_CONFLICT: Data proyek telah diperbarui oleh pengguna atau sesi lain. Silakan muat ulang data terbaru.'
-          );
-          (err as any).code = 'OCC_CONFLICT';
-          throw err;
+        expectedUpdatedAt = new Date(data.expectedProjectUpdatedAt);
+
+        if (Number.isNaN(expectedUpdatedAt.getTime())) {
+          throw new Error('INVALID_OCC_TIMESTAMP');
         }
       }
 
-      return prisma.project.update({
-        where: { id },
-        data: {
-          ...(data.name ? { name: data.name } : {}),
-          ...(data.masterInput ? { masterInput: data.masterInput } : {}),
-          ...(data.documents ? { documents: data.documents } : {}),
-        },
+      return prisma.$transaction(async (tx) => {
+        const updateResult = await tx.project.updateMany({
+          where: {
+            ...scopedWhere,
+            ...(expectedUpdatedAt
+              ? { updatedAt: expectedUpdatedAt }
+              : {}),
+          },
+          data: updateData,
+        });
+
+        if (updateResult.count !== 1) {
+          const existing = await tx.project.findFirst({
+            where: scopedWhere,
+            select: { id: true },
+          });
+
+          if (existing && expectedUpdatedAt) {
+            const err = new Error(
+              'OCC_CONFLICT: Data proyek telah diperbarui oleh pengguna atau sesi lain. Silakan muat ulang data terbaru.'
+            );
+            (err as any).code = 'OCC_CONFLICT';
+            throw err;
+          }
+
+          throw new Error(
+            `Proyek tidak ditemukan atau akses ditolak untuk ID: ${id}`
+          );
+        }
+
+        const updatedProject = await tx.project.findFirst({
+          where: scopedWhere,
+        });
+
+        if (!updatedProject) {
+          throw new Error(
+            `Proyek tidak ditemukan atau akses ditolak untuk ID: ${id}`
+          );
+        }
+
+        return updatedProject;
       });
     } else {
       this.checkProductionDatabase();
       this.initDefaultProjects();
+
       const existing = this.memProjects.get(id);
-      if (!existing || existing.institutionId !== institutionId || (userId && existing.userId !== userId)) {
-        throw new Error(`Proyek tidak ditemukan atau akses ditolak untuk ID: ${id}`);
+
+      if (
+        !existing ||
+        existing.institutionId !== institutionId ||
+        (userId && existing.userId !== userId)
+      ) {
+        throw new Error(
+          `Proyek tidak ditemukan atau akses ditolak untuk ID: ${id}`
+        );
       }
 
-      // Optimistic Concurrency Control (OCC) Check
       if (data.expectedProjectUpdatedAt) {
-        const expectedTime = new Date(data.expectedProjectUpdatedAt).getTime();
+        const expectedTime = new Date(
+          data.expectedProjectUpdatedAt
+        ).getTime();
+
         const actualTime = new Date(existing.updatedAt).getTime();
-        if (expectedTime !== actualTime) {
+
+        if (
+          Number.isNaN(expectedTime) ||
+          expectedTime !== actualTime
+        ) {
           const err = new Error(
             'OCC_CONFLICT: Data proyek telah diperbarui oleh pengguna atau sesi lain. Silakan muat ulang data terbaru.'
           );
@@ -425,6 +478,7 @@ export class ProjectRepository {
       if (data.name) existing.name = data.name;
       if (data.masterInput) existing.masterInput = data.masterInput;
       if (data.documents) existing.documents = data.documents;
+
       existing.updatedAt = new Date();
 
       return existing as any;
@@ -450,33 +504,59 @@ export class ProjectRepository {
   /**
    * Deletes a project with strict tenant boundary and ownership verification.
    */
-  async deleteProject(id: string, institutionId: string, userId?: string): Promise<Project> {
+  async deleteProject(
+    id: string,
+    institutionId: string,
+    userId?: string
+  ): Promise<Project> {
     if (this.isDbConfigured) {
-      // Verify existence and tenant ownership
-      const existing = await prisma.project.findFirst({
-        where: {
-          id,
-          institutionId,
-          ...(userId ? { userId } : {}),
-        },
-      });
+      const scopedWhere = {
+        id,
+        institutionId,
+        ...(userId ? { userId } : {}),
+      };
 
-      if (!existing) {
-        throw new Error(`Proyek tidak ditemukan atau akses ditolak untuk ID: ${id}`);
-      }
+      return prisma.$transaction(async (tx) => {
+        const existing = await tx.project.findFirst({
+          where: scopedWhere,
+        });
 
-      return prisma.project.delete({
-        where: { id },
+        if (!existing) {
+          throw new Error(
+            `Proyek tidak ditemukan atau akses ditolak untuk ID: ${id}`
+          );
+        }
+
+        const deleteResult = await tx.project.deleteMany({
+          where: scopedWhere,
+        });
+
+        if (deleteResult.count !== 1) {
+          throw new Error(
+            `Proyek tidak ditemukan atau akses ditolak untuk ID: ${id}`
+          );
+        }
+
+        return existing;
       });
     } else {
       this.checkProductionDatabase();
       this.initDefaultProjects();
+
       const existing = this.memProjects.get(id);
-      if (!existing || existing.institutionId !== institutionId || (userId && existing.userId !== userId)) {
-        throw new Error(`Proyek tidak ditemukan atau akses ditolak untuk ID: ${id}`);
+
+      if (
+        !existing ||
+        existing.institutionId !== institutionId ||
+        (userId && existing.userId !== userId)
+      ) {
+        throw new Error(
+          `Proyek tidak ditemukan atau akses ditolak untuk ID: ${id}`
+        );
       }
 
       this.memProjects.delete(id);
+
       return existing as any;
     }
   }

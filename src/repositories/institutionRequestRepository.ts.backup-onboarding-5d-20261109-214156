@@ -1,0 +1,91 @@
+import {
+  InstitutionRequest,
+  InstitutionRequestStatus,
+  Prisma,
+  PrismaClient,
+} from '@prisma/client';
+import { prisma } from '../db/prisma';
+
+type DbClient = Prisma.TransactionClient | PrismaClient;
+
+export class InstitutionRequestRepository {
+  // Operasi tulis wajib memakai transaction client.
+  async create(
+    tx: Prisma.TransactionClient,
+    data: Prisma.InstitutionRequestCreateInput
+  ): Promise<InstitutionRequest> {
+    return tx.institutionRequest.create({ data });
+  }
+
+  // Operasi baca dapat menggunakan Prisma biasa atau transaction client.
+  async findById(
+    id: string,
+    db: DbClient = prisma
+  ): Promise<InstitutionRequest | null> {
+    return db.institutionRequest.findUnique({ where: { id } });
+  }
+
+  async findPendingByNpsn(
+    npsn: string,
+    tx: Prisma.TransactionClient
+  ): Promise<InstitutionRequest | null> {
+    return tx.institutionRequest.findFirst({
+      where: {
+        npsn: npsn.trim(),
+        status: InstitutionRequestStatus.PENDING_REVIEW,
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  async listByRequester(
+    requesterUserId: string,
+    take = 25,
+    skip = 0,
+    db: DbClient = prisma
+  ): Promise<InstitutionRequest[]> {
+    const safeTake = Math.min(Math.max(take, 1), 100);
+    const safeSkip = Math.max(skip, 0);
+
+    return db.institutionRequest.findMany({
+      where: { requesterUserId },
+      orderBy: { createdAt: 'desc' },
+      take: safeTake,
+      skip: safeSkip,
+    });
+  }
+
+  async listPending(
+    take = 25,
+    skip = 0,
+    db: DbClient = prisma
+  ): Promise<InstitutionRequest[]> {
+    const safeTake = Math.min(Math.max(take, 1), 100);
+    const safeSkip = Math.max(skip, 0);
+
+    return db.institutionRequest.findMany({
+      where: { status: InstitutionRequestStatus.PENDING_REVIEW },
+      orderBy: { createdAt: 'asc' },
+      take: safeTake,
+      skip: safeSkip,
+    });
+  }
+
+  // Perubahan status hanya boleh terjadi jika status sebelumnya cocok.
+  async transitionStatus(
+    tx: Prisma.TransactionClient,
+    id: string,
+    expectedStatus: InstitutionRequestStatus,
+    data: Prisma.InstitutionRequestUpdateManyMutationInput
+  ): Promise<number> {
+    const result = await tx.institutionRequest.updateMany({
+      where: { id, status: expectedStatus },
+      data,
+    });
+
+    return result.count;
+  }
+}
+
+export const institutionRequestRepository =
+  new InstitutionRequestRepository();

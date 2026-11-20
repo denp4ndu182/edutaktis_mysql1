@@ -1,0 +1,322 @@
+import {
+  InstitutionRole,
+  MembershipStatus,
+  Prisma,
+} from '@prisma/client';
+
+import { membershipRepository } from '../repositories/membershipRepository';
+import { auditLogRepository } from '../repositories/auditLogRepository';
+import { withOnboardingTransaction } from '../security/onboardingTransaction';
+
+export interface PendingMembershipListInput {
+  institutionId: string;
+  actorUserId: string;
+  take?: number;
+  skip?: number;
+}
+
+export interface ReviewMembershipInput {
+  membershipId: string;
+  institutionId: string;
+  actorUserId: string;
+  ipAddress?: string;
+}
+
+export interface RejectMembershipInput extends ReviewMembershipInput {
+  reason?: string;
+}
+
+function requiredId(value: string, field: string): string {
+  const result = value.trim();
+
+  if (!result || result.length > 36) {
+    throw new Error(`VALIDATION_ERROR: ${field} tidak valid.`);
+  }
+
+  return result;
+}
+
+function validatePagination(take = 50, skip = 0): void {
+  if (
+    !Number.isInteger(take) ||
+    take < 1 ||
+    take > 100 ||
+    !Number.isInteger(skip) ||
+    skip < 0 ||
+    skip > 1_000_000
+  ) {
+    throw new Error('VALIDATION_ERROR: Parameter pagination tidak valid.');
+  }
+}
+
+async function assertAuthorizedReviewer(
+  tx: Prisma.TransactionClient,
+  actorUserId: string,
+  institutionId: string
+): Promise<void> {
+  const actor = await tx.user.findUnique({
+    where: { id: actorUserId },
+    select: { id: true, isActive: true },
+  });
+
+  if (!actor?.isActive) {
+    throw new Error('REVIEWER_NOT_ACTIVE');
+  }
+
+  const membership = await tx.institutionMembership.findUnique({
+    where: {
+      userId_institutionId: {
+        userId: actorUserId,
+        institutionId,
+      },
+    },
+    select: {
+      role: true,
+      status: true,
+    },
+  });
+
+  if (!membership || membership.status !== MembershipStatus.ACTIVE) {
+    throw new Error('REVIEWER_MEMBERSHIP_NOT_ACTIVE');
+  }
+
+  if (
+    membership.role !== InstitutionRole.SCHOOL_ADMIN &&
+    membership.role !== InstitutionRole.SUPER_ADMIN
+  ) {
+    throw new Error('REVIEWER_NOT_AUTHORIZED');
+  }
+}
+
+async function findPendingTarget(
+  tx: Prisma.TransactionClient,
+  membershipId: string,
+  institutionId: string
+) {
+  const target = await tx.institutionMembership.findFirst({
+    where: {
+      id: membershipId,
+      institutionId,
+      status: MembershipStatus.PENDING,
+    },
+    select: {
+      id: true,
+      userId: true,
+      institutionId: true,
+      role: true,
+      status: true,
+    },
+  });
+
+  if (target) return target;
+
+  const existing = await tx.institutionMembership.findFirst({
+    where: {
+      id: membershipId,
+      institutionId,
+    },
+    select: { id: true },
+  });
+
+  if (!existing) {
+    throw new Error('MEMBERSHIP_REQUEST_NOT_FOUND');
+  }
+
+  throw new Error('MEMBERSHIP_REQUEST_STATE_CONFLICT');
+}
+
+export class MembershipApprovalService {
+  async listPending(input: PendingMembershipListInput) {
+    const institutionId = requiredId(
+      input.institutionId,
+      'Institution ID'
+    );
+
+    const actorUserId = requiredId(input.actorUserId, 'Reviewer User ID');
+    const take = input.take ?? 50;
+    const skip = input.skip ?? 0;
+    validatePagination(take, skip);
+
+    return withOnboardingTransaction(async (tx) => {
+      await assertAuthorizedReviewer(tx, actorUserId, institutionId);
+
+      return membershipRepository.listPendingByInstitution(
+        institutionId,
+        tx,
+        take,
+        skip
+      );
+    });
+  }
+
+  async approve(input: ReviewMembershipInput) {
+    const membershipId = requiredId(
+      input.membershipId,
+      'Membership ID'
+    );
+    const institutionId = requiredId(
+      input.institutionId,
+      'Institution ID'
+    );
+    const actorUserId = requiredId(
+      input.actorUserId,
+      'Reviewer User ID'
+    );
+
+    return withOnboardingTransaction(async (tx) => {
+      await assertAuthorizedReviewer(tx, actorUserId, institutionId);
+
+      const target = await findPendingTarget(
+        tx,
+        membershipId,
+        institutionId
+      );
+
+      const applicant = await tx.user.findUnique({
+        where: { id: target.userId },
+        select: { id: true, isActive: true },
+      });
+
+      if (!applicant?.isActive) {
+        throw new Error('APPLICANT_NOT_ACTIVE');
+      }
+
+      const count = await membershipRepository.transitionPendingStatus(
+        target.userId,
+        institutionId,
+        MembershipStatus.ACTIVE,
+        tx
+      );
+
+      if (count !== 1) {
+        throw new Error('MEMBERSHIP_REQUEST_STATE_CONFLICT');
+      }
+
+      await auditLogRepository.createInTransaction(tx, {
+        userId: actorUserId,
+        institutionId,
+        action: 'MEMBERSHIP_REQUEST_APPROVED',
+        resource: 'InstitutionMembership',
+        details: {
+          membershipId: target.id,
+          targetUserId: target.userId,
+          previousStatus: MembershipStatus.PENDING,
+          newStatus: MembershipStatus.ACTIVE,
+          rolePreserved: target.role,
+        },
+        ipAddress: input.ipAddress,
+      });
+
+      const updated = await tx.institutionMembership.findUnique({
+        where: {
+          userId_institutionId: {
+            userId: target.userId,
+            institutionId,
+          },
+        },
+        select: {
+          id: true,
+          userId: true,
+          institutionId: true,
+          role: true,
+          status: true,
+          joinedAt: true,
+          updatedAt: true,
+        },
+      });
+
+      if (!updated) {
+        throw new Error('MEMBERSHIP_NOT_FOUND_AFTER_APPROVAL');
+      }
+
+      return updated;
+    });
+  }
+
+  async reject(input: RejectMembershipInput) {
+    const membershipId = requiredId(
+      input.membershipId,
+      'Membership ID'
+    );
+    const institutionId = requiredId(
+      input.institutionId,
+      'Institution ID'
+    );
+    const actorUserId = requiredId(
+      input.actorUserId,
+      'Reviewer User ID'
+    );
+
+    const reason = input.reason?.trim() || null;
+
+    if (reason && reason.length > 1000) {
+      throw new Error(
+        'VALIDATION_ERROR: Alasan penolakan maksimal 1000 karakter.'
+      );
+    }
+
+    return withOnboardingTransaction(async (tx) => {
+      await assertAuthorizedReviewer(tx, actorUserId, institutionId);
+
+      const target = await findPendingTarget(
+        tx,
+        membershipId,
+        institutionId
+      );
+
+      const count = await membershipRepository.transitionPendingStatus(
+        target.userId,
+        institutionId,
+        MembershipStatus.INACTIVE,
+        tx
+      );
+
+      if (count !== 1) {
+        throw new Error('MEMBERSHIP_REQUEST_STATE_CONFLICT');
+      }
+
+      await auditLogRepository.createInTransaction(tx, {
+        userId: actorUserId,
+        institutionId,
+        action: 'MEMBERSHIP_REQUEST_REJECTED',
+        resource: 'InstitutionMembership',
+        details: {
+          membershipId: target.id,
+          targetUserId: target.userId,
+          previousStatus: MembershipStatus.PENDING,
+          newStatus: MembershipStatus.INACTIVE,
+          rolePreserved: target.role,
+          reason,
+        },
+        ipAddress: input.ipAddress,
+      });
+
+      const updated = await tx.institutionMembership.findUnique({
+        where: {
+          userId_institutionId: {
+            userId: target.userId,
+            institutionId,
+          },
+        },
+        select: {
+          id: true,
+          userId: true,
+          institutionId: true,
+          role: true,
+          status: true,
+          joinedAt: true,
+          updatedAt: true,
+        },
+      });
+
+      if (!updated) {
+        throw new Error('MEMBERSHIP_NOT_FOUND_AFTER_REJECTION');
+      }
+
+      return updated;
+    });
+  }
+}
+
+export const membershipApprovalService =
+  new MembershipApprovalService();

@@ -6,3 +6,8 @@ coverage/
 *.log
 .env*
 !.env.example
+# Local implementation backups - do not commit
+/server.ts.backup-env-step1
+/server.ts.backup-env-step1b
+/scripts/bootstrap-super-admin.ts.backup-env-step1
+/server.js

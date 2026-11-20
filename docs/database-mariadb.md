@@ -19,7 +19,7 @@ Sistem verifikasi EduTaktis SaaS membagi pengujian menjadi 4 tingkatan terpisah:
 1. **Validasi Statis:** Menjalankan `npx prisma validate`, `npx prisma generate`, dan `npx tsc --noEmit` untuk memastikan tipe data, syntax, dan DDL migration valid secara kompilasi.
 2. **Pengujian Lokal / Dev Store:** Menjalankan `npx tsx scripts/test-phase3b.ts` dan `test-phase3c.ts` di lingkungan lokal/development.
 3. **Pengujian MariaDB Live:** Menjalankan `npx tsx scripts/test-phase3d.ts` dengan `DATABASE_URL` terhubung ke MariaDB live (menguji query MariaDB, versi, InnoDB engine, JSON, dan Composite Foreign Key negatif/positif).
-4. **Pengujian Runtime cPanel:** Menguji eksekusi bundel `dist/server.js` melalui Phusion Passenger cPanel Rumahweb.
+4. **Pengujian Runtime cPanel:** Menguji eksekusi bundel `server.js` melalui Phusion Passenger cPanel Rumahweb.
 
 ---
 

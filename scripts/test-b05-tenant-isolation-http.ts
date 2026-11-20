@@ -1,0 +1,1412 @@
+
+import fs from 'node:fs';
+import net from 'node:net';
+import path from 'node:path';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { setTimeout as delay } from 'node:timers/promises';
+import dotenv from 'dotenv';
+
+const ROOT = process.cwd();
+const ENV_PATH = path.join(ROOT, '.env.onboarding-test');
+const SERVER_PORT = 43105;
+const BASE_URL = `http://127.0.0.1:${SERVER_PORT}`;
+const STARTUP_TIMEOUT_MS = 30_000;
+const SHUTDOWN_TIMEOUT_MS = 15_000;
+const FORCE_SHUTDOWN_TIMEOUT_MS = 5_000;
+
+type FixtureModule = typeof import('./fixture-b05-tenant');
+type Fixture = Awaited<
+  ReturnType<FixtureModule['createB05TenantFixture']>
+>;
+type PrismaModule = typeof import('./onboarding-test-prisma');
+
+type JsonResponse = {
+  status: number;
+  body: any;
+  setCookies: string[];
+};
+
+type TestUser = {
+  email: string;
+  jar: CookieJar;
+  csrfToken: string;
+};
+
+type ChildExitResult = {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+};
+
+type ChildSpawnResult =
+  | { spawned: true }
+  | { spawned: false; error: Error };
+
+let fixture: Fixture | undefined;
+let fixtureModule: FixtureModule | undefined;
+let prisma: PrismaModule['prisma'] | undefined;
+
+let child: ChildProcess | undefined;
+let childSpawn: Promise<ChildSpawnResult> | undefined;
+let childExit: Promise<ChildExitResult> | undefined;
+let childRuntimeError: Error | undefined;
+
+let temporaryProject:
+  | {
+      id: string;
+      userId: string;
+      institutionId: string;
+    }
+  | undefined;
+
+let temporaryProjectOwnerSession: TestUser | undefined;
+
+let cleanupSafe = true;
+let cleanupFailed = false;
+let passed = 0;
+
+const failures: string[] = [];
+let serverOutput = '';
+
+function assert(
+  condition: unknown,
+  message: string
+): asserts condition {
+  if (!condition) {
+    console.error(`FAIL: ${message}`);
+    throw new Error(`Assertion gagal: ${message}`);
+  }
+
+  passed++;
+  console.log(`PASS ${passed}: ${message}`);
+}
+
+function requireCondition(
+  condition: unknown,
+  message: string
+): asserts condition {
+  if (!condition) {
+    throw new Error(message);
+  }
+}
+
+function recordFailure(message: string): void {
+  failures.push(message);
+  console.error(`FAIL: ${message}`);
+}
+
+function validateEnvironment(): {
+  databaseUrl: string;
+  password: string;
+} {
+  if (!fs.existsSync(ENV_PATH)) {
+    throw new Error('.env.onboarding-test tidak ditemukan.');
+  }
+
+  const config = dotenv.parse(fs.readFileSync(ENV_PATH));
+
+  if (
+    config.MYSQL_DATABASE !==
+    'edutaktis_onboarding_test'
+  ) {
+    throw new Error(
+      'Database pengujian tidak sesuai. Proses dihentikan.'
+    );
+  }
+
+  if (!config.MYSQL_USER || !config.MYSQL_PASSWORD) {
+    throw new Error(
+      'Konfigurasi MySQL pengujian tidak lengkap.'
+    );
+  }
+
+  const password = config.B05_TEST_PASSWORD;
+
+  if (
+    !password ||
+    password.length < 12 ||
+    password.length > 128 ||
+    !/[A-Z]/.test(password) ||
+    !/[a-z]/.test(password) ||
+    !/[0-9]/.test(password)
+  ) {
+    throw new Error(
+      'B05_TEST_PASSWORD belum memenuhi persyaratan.'
+    );
+  }
+
+  const credentials =
+    `${encodeURIComponent(config.MYSQL_USER)}:` +
+    `${encodeURIComponent(config.MYSQL_PASSWORD)}`;
+
+  return {
+    databaseUrl:
+      `mysql://${credentials}` +
+      '@127.0.0.1:3307/edutaktis_onboarding_test',
+    password,
+  };
+}
+
+async function assertPortAvailable(
+  port: number
+): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const probe = net.createServer();
+
+    probe.once('error', reject);
+
+    probe.listen(port, '127.0.0.1', () => {
+      probe.close((error) => {
+        if (error) {
+          reject(error);
+        } else {
+          resolve();
+        }
+      });
+    });
+  });
+}
+
+function appendServerOutput(
+  chunk: Buffer | string
+): void {
+  serverOutput += chunk.toString();
+
+  if (serverOutput.length > 12_000) {
+    serverOutput = serverOutput.slice(-12_000);
+  }
+}
+
+async function startTestServer(
+  databaseUrl: string
+): Promise<void> {
+  await assertPortAvailable(SERVER_PORT);
+
+  const tsxCli = path.join(
+    ROOT,
+    'node_modules/tsx/dist/cli.mjs'
+  );
+
+  if (!fs.existsSync(tsxCli)) {
+    throw new Error('tsx CLI tidak ditemukan.');
+  }
+
+  child = spawn(
+    process.execPath,
+    [tsxCli, 'server.ts'],
+    {
+      cwd: ROOT,
+      env: {
+        ...process.env,
+        DATABASE_URL: databaseUrl,
+        NODE_ENV: 'test',
+        PORT: String(SERVER_PORT),
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }
+  );
+
+  const currentChild = child;
+
+  currentChild.stdout?.on(
+    'data',
+    appendServerOutput
+  );
+
+  currentChild.stderr?.on(
+    'data',
+    appendServerOutput
+  );
+
+  childSpawn = new Promise<ChildSpawnResult>(
+    (resolve) => {
+      const onSpawn = () => {
+        currentChild.off('error', onSpawnError);
+        resolve({ spawned: true });
+      };
+
+      const onSpawnError = (error: Error) => {
+        currentChild.off('spawn', onSpawn);
+        resolve({
+          spawned: false,
+          error,
+        });
+      };
+
+      currentChild.once('spawn', onSpawn);
+      currentChild.once('error', onSpawnError);
+    }
+  );
+
+  childExit = new Promise<ChildExitResult>(
+    (resolve) => {
+      currentChild.once('exit', (code, signal) => {
+        resolve({
+          code,
+          signal,
+        });
+      });
+    }
+  );
+
+  currentChild.on('error', (error) => {
+    childRuntimeError = error;
+    appendServerOutput(
+      `\n[CHILD PROCESS ERROR] ${error.message}\n`
+    );
+  });
+
+  const spawnResult = await childSpawn;
+
+  if (!spawnResult.spawned) {
+    throw new Error(
+      `Gagal menjalankan proses server: ${spawnResult.error.message}`
+    );
+  }
+
+  const deadline = Date.now() + STARTUP_TIMEOUT_MS;
+
+  while (Date.now() < deadline) {
+    if (childRuntimeError) {
+      throw new Error(
+        `Terjadi error pada proses server: ${childRuntimeError.message}`
+      );
+    }
+
+    const exited = await Promise.race([
+      childExit.then((result) => ({
+        exited: true as const,
+        result,
+      })),
+      delay(250).then(() => ({
+        exited: false as const,
+      })),
+    ]);
+
+    if (exited.exited) {
+      throw new Error(
+        'Server berhenti sebelum siap. ' +
+        `Exit code: ${exited.result.code}, ` +
+        `signal: ${exited.result.signal}.`
+      );
+    }
+
+    try {
+      const response = await fetch(
+        `${BASE_URL}/api/auth/csrf`,
+        {
+          signal: AbortSignal.timeout(2_000),
+        }
+      );
+
+      if (response.ok) {
+        console.log('SERVER READY.');
+        return;
+      }
+    } catch {
+      // Server belum siap.
+    }
+  }
+
+  throw new Error(
+    'Server tidak siap dalam 30 detik.'
+  );
+}
+
+async function stopTestServer(): Promise<void> {
+  if (!child || !childSpawn || !childExit) {
+    return;
+  }
+
+  const current = child;
+  const spawnResult = await childSpawn;
+
+  // Spawn gagal: tidak ada proses server yang berhasil dibuat.
+  if (!spawnResult.spawned) {
+    if (current.pid === undefined) {
+      console.log(
+        'SERVER NOT STARTED. Tidak ada proses untuk dihentikan.'
+      );
+      return;
+    }
+
+    throw new Error(
+      'Spawn server gagal tetapi PID tersedia. Cleanup fixture ditahan.'
+    );
+  }
+
+  if (current.pid === undefined) {
+    throw new Error(
+      'PID server tidak tersedia. Cleanup fixture ditahan.'
+    );
+  }
+
+  const wasAlreadyExited =
+    current.exitCode !== null ||
+    current.signalCode !== null;
+
+  if (wasAlreadyExited) {
+    const result = await childExit;
+
+    if (
+      childRuntimeError ||
+      result.code !== 0 ||
+      result.signal !== null
+    ) {
+      throw new Error(
+        `Server berhenti tidak normal: ${result.code}/${result.signal}. Cleanup fixture ditahan.`
+      );
+    }
+
+    console.log('SERVER STOPPED.');
+    return;
+  }
+
+  let killSent: boolean;
+
+  try {
+    killSent = current.kill('SIGTERM');
+  } catch (error) {
+    throw new Error(
+      `Gagal mengirim SIGTERM: ${
+        error instanceof Error
+          ? error.message
+          : 'unknown error'
+      }`
+    );
+  }
+
+  if (
+    !killSent &&
+    current.exitCode === null &&
+    current.signalCode === null
+  ) {
+    throw new Error(
+      'SIGTERM gagal dikirim dan proses masih berjalan. Cleanup fixture ditahan.'
+    );
+  }
+
+  const gracefulStop = await Promise.race([
+    childExit.then((result) => ({
+      stopped: true as const,
+      result,
+    })),
+    delay(SHUTDOWN_TIMEOUT_MS).then(() => ({
+      stopped: false as const,
+    })),
+  ]);
+
+  if (!gracefulStop.stopped) {
+    console.error(
+      'SIGTERM timeout. Mengirim SIGKILL.'
+    );
+
+    let forceKillSent = false;
+
+    try {
+      forceKillSent = current.kill('SIGKILL');
+    } catch {
+      // Status proses tetap diperiksa di bawah.
+    }
+
+    const forcedStop = await Promise.race([
+      childExit.then((result) => ({
+        stopped: true as const,
+        result,
+      })),
+      delay(FORCE_SHUTDOWN_TIMEOUT_MS).then(() => ({
+        stopped: false as const,
+      })),
+    ]);
+
+    if (!forcedStop.stopped) {
+      throw new Error(
+        'Server tidak berhenti setelah SIGKILL. ' +
+        `Kill sent: ${forceKillSent}. ` +
+        'Cleanup fixture ditahan.'
+      );
+    }
+
+    throw new Error(
+      'Server hanya berhenti setelah SIGKILL. Cleanup fixture ditahan.'
+    );
+  }
+
+  const result = gracefulStop.result;
+
+  if (
+    childRuntimeError ||
+    result.code !== 0 ||
+    result.signal !== null
+  ) {
+    throw new Error(
+      `Server berhenti tidak normal: ${result.code}/${result.signal}. Cleanup fixture ditahan.`
+    );
+  }
+
+  console.log('SERVER STOPPED.');
+}
+
+class CookieJar {
+  private cookies = new Map<string, string>();
+
+  absorb(response: Response): void {
+    for (const item of response.headers.getSetCookie()) {
+      const pair = item.split(';', 1)[0];
+      const separator = pair.indexOf('=');
+
+      if (separator < 1) {
+        continue;
+      }
+
+      const name = pair.slice(0, separator);
+      const value = pair.slice(separator + 1);
+
+      if (!value) {
+        this.cookies.delete(name);
+      } else {
+        this.cookies.set(name, value);
+      }
+    }
+  }
+
+  header(): string {
+    return [...this.cookies.entries()]
+      .map(([name, value]) => `${name}=${value}`)
+      .join('; ');
+  }
+
+  has(name: string): boolean {
+    return this.cookies.has(name);
+  }
+}
+
+async function request(
+  method: string,
+  endpoint: string,
+  options: {
+    jar?: CookieJar;
+    csrfToken?: string;
+    institutionId?: string;
+    body?: unknown;
+    origin?: string;
+  } = {}
+): Promise<JsonResponse> {
+  const headers: Record<string, string> = {
+    Accept: 'application/json',
+    'User-Agent': 'EduTaktis-B05-Integration-Test',
+  };
+
+  if (options.jar) {
+    headers.Cookie = options.jar.header();
+  }
+
+  if (options.csrfToken !== undefined) {
+    headers['X-CSRF-Token'] = options.csrfToken;
+  }
+
+  if (options.institutionId !== undefined) {
+    headers['X-Institution-Id'] = options.institutionId;
+  }
+
+  if (options.origin !== undefined) {
+    headers.Origin = options.origin;
+  }
+
+  if (options.body !== undefined) {
+    headers['Content-Type'] = 'application/json';
+  }
+
+  const response = await fetch(
+    `${BASE_URL}${endpoint}`,
+    {
+      method,
+      headers,
+      body:
+        options.body === undefined
+          ? undefined
+          : JSON.stringify(options.body),
+      signal: AbortSignal.timeout(10_000),
+    }
+  );
+
+  options.jar?.absorb(response);
+
+  let body: any = null;
+
+  try {
+    body = await response.json();
+  } catch {
+    // Respons non-JSON.
+  }
+
+  return {
+    status: response.status,
+    body,
+    setCookies: response.headers.getSetCookie(),
+  };
+}
+
+async function loginUser(
+  email: string,
+  password: string
+): Promise<TestUser> {
+  const jar = new CookieJar();
+
+  const csrf = await request(
+    'GET',
+    '/api/auth/csrf',
+    { jar }
+  );
+
+  requireCondition(
+    csrf.status === 200 &&
+    typeof csrf.body?.csrfToken === 'string' &&
+    jar.has('edutaktis_csrf'),
+    `Gagal memperoleh CSRF untuk ${email}.`
+  );
+
+  const login = await request(
+    'POST',
+    '/api/auth/login',
+    {
+      jar,
+      csrfToken: csrf.body.csrfToken,
+      origin: BASE_URL,
+      body: {
+        email,
+        password,
+      },
+    }
+  );
+
+  requireCondition(
+    login.status === 200 &&
+    login.body?.success === true &&
+    jar.has('edutaktis_session') &&
+    jar.has('edutaktis_csrf'),
+    `Login gagal untuk ${email}.`
+  );
+
+  const csrfToken = login.body.csrfToken;
+
+  requireCondition(
+    typeof csrfToken === 'string' &&
+    jar.header().includes(
+      `edutaktis_csrf=${csrfToken}`
+    ),
+    `Rotasi CSRF tidak valid untuk ${email}.`
+  );
+
+  return {
+    email,
+    jar,
+    csrfToken,
+  };
+}
+
+function authOptions(
+  user: TestUser,
+  institutionId?: string
+) {
+  return {
+    jar: user.jar,
+    csrfToken: user.csrfToken,
+    origin: BASE_URL,
+    institutionId,
+  };
+}
+
+async function runTests(
+  password: string
+): Promise<void> {
+  requireCondition(
+    fixture,
+    'Fixture belum tersedia.'
+  );
+
+  const f = fixture;
+
+  const [
+    schoolAdminA,
+    headmasterA,
+    teacherA,
+    operatorA,
+    pendingA,
+    inactiveA,
+    schoolAdminB,
+    teacherB,
+    superAdminB,
+  ] = await Promise.all(
+    f.users.map((user) =>
+      loginUser(user.email, password)
+    )
+  );
+
+  const [tenantA, tenantB] = f.institutions;
+
+  const [
+    teacherProject,
+    headmasterProject,
+    tenantBProject,
+  ] = f.projects;
+
+  const anonymous = await request(
+    'GET',
+    '/api/tenant/projects'
+  );
+
+  assert(
+    anonymous.status === 401 &&
+    anonymous.body?.code === 'UNAUTHENTICATED',
+    'Akses project tanpa sesi ditolak.'
+  );
+
+  const noTenant = await request(
+    'GET',
+    '/api/tenant/projects',
+    {
+      jar: teacherA.jar,
+    }
+  );
+
+  assert(
+    noTenant.status === 400,
+    'Permintaan tanpa tenant ditolak.'
+  );
+
+  const crossTenant = await request(
+    'GET',
+    '/api/tenant/projects',
+    {
+      ...authOptions(teacherA),
+      institutionId: tenantB.id,
+    }
+  );
+
+  assert(
+    crossTenant.status === 403 &&
+    crossTenant.body?.code === 'TENANT_FORBIDDEN',
+    'Teacher A tidak dapat memasuki tenant B.'
+  );
+
+  for (
+    const [label, user] of [
+      ['PENDING', pendingA],
+      ['INACTIVE', inactiveA],
+    ] as const
+  ) {
+    const response = await request(
+      'GET',
+      '/api/tenant/projects',
+      {
+        ...authOptions(user),
+        institutionId: tenantA.id,
+      }
+    );
+
+    assert(
+      response.status === 403 &&
+      response.body?.code === 'MEMBERSHIP_PENDING',
+      `Membership ${label} ditolak.`
+    );
+  }
+
+  const teacherList = await request(
+    'GET',
+    '/api/tenant/projects',
+    authOptions(teacherA, tenantA.id)
+  );
+
+  assert(
+    teacherList.status === 200 &&
+    teacherList.body?.success === true &&
+    Array.isArray(teacherList.body?.projects) &&
+    teacherList.body.projects.length === 1 &&
+    teacherList.body.projects[0].id === teacherProject.id,
+    'Teacher A hanya melihat project miliknya.'
+  );
+
+  for (
+    const [label, user] of [
+      ['Headmaster', headmasterA],
+      ['Operator', operatorA],
+      ['School Admin', schoolAdminA],
+    ] as const
+  ) {
+    const response = await request(
+      'GET',
+      '/api/tenant/projects',
+      authOptions(user, tenantA.id)
+    );
+
+    assert(
+      response.status === 200 &&
+      response.body?.projects?.length === 2 &&
+      response.body.projects.every(
+        (project: any) =>
+          project.institutionId === tenantA.id
+      ),
+      `${label} A melihat project tenant A saja.`
+    );
+  }
+
+  const ownProject = await request(
+    'GET',
+    `/api/tenant/projects/${teacherProject.id}`,
+    authOptions(teacherA, tenantA.id)
+  );
+
+  assert(
+    ownProject.status === 200,
+    'Teacher A dapat melihat project miliknya.'
+  );
+
+  const otherOwnerProject = await request(
+    'GET',
+    `/api/tenant/projects/${headmasterProject.id}`,
+    authOptions(teacherA, tenantA.id)
+  );
+
+  assert(
+    otherOwnerProject.status === 403 &&
+    otherOwnerProject.body?.code ===
+      'INSUFFICIENT_PROJECT_VIEW_PERMISSION',
+    'Teacher A tidak dapat melihat project pemilik lain.'
+  );
+
+  const crossTenantProject = await request(
+    'GET',
+    `/api/tenant/projects/${tenantBProject.id}`,
+    authOptions(teacherA, tenantA.id)
+  );
+
+  assert(
+    crossTenantProject.status === 404 &&
+    crossTenantProject.body?.code === 'PROJECT_NOT_FOUND',
+    'Project tenant B disamarkan sebagai tidak ditemukan.'
+  );
+
+  const headmasterView = await request(
+    'GET',
+    `/api/tenant/projects/${teacherProject.id}`,
+    authOptions(headmasterA, tenantA.id)
+  );
+
+  assert(
+    headmasterView.status === 200,
+    'Headmaster A dapat melihat project guru dalam tenant A.'
+  );
+
+  const operatorView = await request(
+    'GET',
+    `/api/tenant/projects/${teacherProject.id}`,
+    authOptions(operatorA, tenantA.id)
+  );
+
+  assert(
+    operatorView.status === 200,
+    'Operator A dapat melihat project guru dalam tenant A.'
+  );
+
+  const forgedCreate = await request(
+    'POST',
+    '/api/tenant/projects',
+    {
+      ...authOptions(teacherA, tenantA.id),
+      body: {
+        name: 'B05 Temporary HTTP Project',
+        masterInput: {
+          fixtureMarker: f.marker,
+        },
+        documents: {},
+        userId: f.users[6].id,
+        institutionId: tenantB.id,
+      },
+    }
+  );
+
+  const createdProject = forgedCreate.body?.project;
+
+  // Catat project segera setelah API menyatakan berhasil membuatnya.
+  // Jangan menunggu validasi identitas agar cleanup dapat mendeteksinya.
+  if (
+    forgedCreate.status === 201 &&
+    typeof createdProject?.id === 'string' &&
+    typeof createdProject?.userId === 'string' &&
+    typeof createdProject?.institutionId === 'string'
+  ) {
+    temporaryProject = {
+      id: createdProject.id,
+      userId: createdProject.userId,
+      institutionId: createdProject.institutionId,
+    };
+
+    temporaryProjectOwnerSession = teacherA;
+  }
+
+  assert(
+    forgedCreate.status === 201 &&
+    temporaryProject !== undefined &&
+    createdProject.userId === f.users[2].id &&
+    createdProject.institutionId === tenantA.id,
+    'Create project mengabaikan identitas tenant dari klien.'
+  );
+
+  const operatorCreate = await request(
+    'POST',
+    '/api/tenant/projects',
+    {
+      ...authOptions(operatorA, tenantA.id),
+      body: {
+        name: 'B05 Forbidden Operator Project',
+        masterInput: {
+          fixtureMarker: f.marker,
+        },
+      },
+    }
+  );
+
+  assert(
+    operatorCreate.status === 403 &&
+    operatorCreate.body?.code === 'FORBIDDEN_PROJECT_CREATE',
+    'Operator tidak memiliki izin membuat project.'
+  );
+
+  const teacherEditOther = await request(
+    'PUT',
+    `/api/tenant/projects/${headmasterProject.id}`,
+    {
+      ...authOptions(teacherA, tenantA.id),
+      body: {
+        name: 'B05 Forbidden Update',
+      },
+    }
+  );
+
+  assert(
+    teacherEditOther.status === 403 &&
+    teacherEditOther.body?.code ===
+      'INSUFFICIENT_PROJECT_EDIT_PERMISSION',
+    'Teacher tidak dapat mengubah project milik pengguna lain.'
+  );
+
+  const forgedOwner = await request(
+    'PUT',
+    `/api/tenant/projects/${teacherProject.id}`,
+    {
+      ...authOptions(teacherA, tenantA.id),
+      body: {
+        userId: f.users[1].id,
+      },
+    }
+  );
+
+  assert(
+    forgedOwner.status === 400 &&
+    forgedOwner.body?.code === 'IMMUTABLE_USER_ID',
+    'Perubahan userId project ditolak.'
+  );
+
+  const forgedTenant = await request(
+    'PUT',
+    `/api/tenant/projects/${teacherProject.id}`,
+    {
+      ...authOptions(teacherA, tenantA.id),
+      body: {
+        institutionId: tenantB.id,
+      },
+    }
+  );
+
+  assert(
+    forgedTenant.status === 400 &&
+    forgedTenant.body?.code === 'IMMUTABLE_INSTITUTION_ID',
+    'Pemindahan project lintas tenant ditolak.'
+  );
+
+  const crossTenantDelete = await request(
+    'DELETE',
+    `/api/tenant/projects/${teacherProject.id}`,
+    authOptions(teacherB, tenantB.id)
+  );
+
+  assert(
+    crossTenantDelete.status === 404 &&
+    crossTenantDelete.body?.code === 'PROJECT_NOT_FOUND',
+    'Tenant B tidak dapat menghapus project tenant A.'
+  );
+
+  const operatorDelete = await request(
+    'DELETE',
+    `/api/tenant/projects/${teacherProject.id}`,
+    authOptions(operatorA, tenantA.id)
+  );
+
+  assert(
+    operatorDelete.status === 403 &&
+    operatorDelete.body?.code ===
+      'INSUFFICIENT_PROJECT_DELETE_PERMISSION',
+    'Operator tidak dapat menghapus project.'
+  );
+
+  await testDocumentAccess(
+    teacherA,
+    headmasterA,
+    teacherB,
+    tenantA.id,
+    tenantB.id,
+    teacherProject.id,
+    headmasterProject.id,
+    tenantBProject.id
+  );
+
+  const schoolAdminBList = await request(
+    'GET',
+    '/api/tenant/projects',
+    authOptions(schoolAdminB, tenantB.id)
+  );
+
+  assert(
+    schoolAdminBList.status === 200 &&
+    schoolAdminBList.body?.projects?.length === 1 &&
+    schoolAdminBList.body.projects[0].id === tenantBProject.id,
+    'School Admin B hanya melihat project tenant B.'
+  );
+
+  const superAdminBList = await request(
+    'GET',
+    '/api/tenant/projects',
+    authOptions(superAdminB, tenantB.id)
+  );
+
+  assert(
+    superAdminBList.status === 200 &&
+    superAdminBList.body?.projects?.length === 1,
+    'SUPER_ADMIN membership B melihat project tenant B.'
+  );
+}
+
+async function testDocumentAccess(
+  teacherA: TestUser,
+  headmasterA: TestUser,
+  teacherB: TestUser,
+  tenantAId: string,
+  tenantBId: string,
+  teacherProjectId: string,
+  headmasterProjectId: string,
+  tenantBProjectId: string
+): Promise<void> {
+  const types = [
+    {
+      path: 'modul-ajar',
+      label: 'Modul Ajar',
+    },
+    {
+      path: 'lkpd',
+      label: 'LKPD',
+    },
+  ] as const;
+
+  for (const type of types) {
+    const ownList = await request(
+      'GET',
+      `/api/tenant/projects/${teacherProjectId}/${type.path}`,
+      authOptions(teacherA, tenantAId)
+    );
+
+    assert(
+      ownList.status === 200 &&
+      ownList.body?.success === true &&
+      Array.isArray(ownList.body?.data) &&
+      ownList.body.data.length === 1,
+      `Teacher A dapat melihat koleksi ${type.label} miliknya.`
+    );
+
+    const document = ownList.body.data[0];
+
+    requireCondition(
+      typeof document?.id === 'string',
+      `ID ${type.label} fixture tidak tersedia.`
+    );
+
+    const ownDetail = await request(
+      'GET',
+      `/api/tenant/projects/${teacherProjectId}/${type.path}/${encodeURIComponent(document.id)}`,
+      authOptions(teacherA, tenantAId)
+    );
+
+    assert(
+      ownDetail.status === 200,
+      `Teacher A dapat melihat detail ${type.label} miliknya.`
+    );
+
+    const denied = await request(
+      'GET',
+      `/api/tenant/projects/${headmasterProjectId}/${type.path}`,
+      authOptions(teacherA, tenantAId)
+    );
+
+    assert(
+      denied.status === 403 &&
+      denied.body?.code ===
+        'INSUFFICIENT_PROJECT_VIEW_PERMISSION',
+      `Teacher A tidak dapat melihat ${type.label} pemilik lain.`
+    );
+
+    const crossTenant = await request(
+      'GET',
+      `/api/tenant/projects/${tenantBProjectId}/${type.path}`,
+      authOptions(teacherA, tenantAId)
+    );
+
+    assert(
+      crossTenant.status === 404 &&
+      crossTenant.body?.code === 'PROJECT_NOT_FOUND',
+      `Teacher A tidak dapat melihat ${type.label} tenant B.`
+    );
+
+    const headmasterView = await request(
+      'GET',
+      `/api/tenant/projects/${teacherProjectId}/${type.path}`,
+      authOptions(headmasterA, tenantAId)
+    );
+
+    assert(
+      headmasterView.status === 200,
+      `Headmaster A dapat melihat ${type.label} project guru.`
+    );
+
+    const deniedUpdate = await request(
+      'PUT',
+      `/api/tenant/projects/${headmasterProjectId}/${type.path}/${encodeURIComponent(document.id)}`,
+      {
+        ...authOptions(teacherA, tenantAId),
+        body: {
+          title: 'B05 forbidden document update',
+          changelog: 'B05 negative test',
+        },
+      }
+    );
+
+    assert(
+      deniedUpdate.status === 403 &&
+      deniedUpdate.body?.code ===
+        'INSUFFICIENT_PROJECT_EDIT_PERMISSION',
+      `Teacher A tidak dapat mengubah ${type.label} project lain.`
+    );
+  }
+
+  const missingCsrf = await request(
+    'PUT',
+    `/api/tenant/projects/${teacherProjectId}`,
+    {
+      jar: teacherA.jar,
+      origin: BASE_URL,
+      institutionId: tenantAId,
+      body: {
+        name: 'B05 CSRF negative test',
+      },
+    }
+  );
+
+  assert(
+    missingCsrf.status === 403 &&
+    missingCsrf.body?.code === 'CSRF_TOKEN_MISSING',
+    'Mutasi project tanpa CSRF ditolak.'
+  );
+
+  const wrongOrigin = await request(
+    'PUT',
+    `/api/tenant/projects/${teacherProjectId}`,
+    {
+      ...authOptions(teacherA, tenantAId),
+      origin: 'https://invalid.example',
+      body: {
+        name: 'B05 invalid origin test',
+      },
+    }
+  );
+
+  assert(
+    wrongOrigin.status === 403 &&
+    wrongOrigin.body?.code === 'CSRF_ORIGIN_MISMATCH',
+    'Mutasi project dari origin yang tidak sah ditolak.'
+  );
+
+  // Dipertahankan untuk konsistensi signature
+  // dan skenario login akun tenant B.
+  void teacherB;
+  void tenantBId;
+}
+
+async function removeTemporaryProject(): Promise<void> {
+  if (!temporaryProject) {
+    return;
+  }
+
+  requireCondition(
+    fixture &&
+    prisma &&
+    temporaryProjectOwnerSession,
+    'Prasyarat penghapusan project sementara tidak tersedia.'
+  );
+
+  const owner = fixture.users[2];
+  const tenant = fixture.institutions[0];
+
+  const preflight = await prisma.project.findUnique({
+    where: {
+      id: temporaryProject.id,
+    },
+    select: {
+      id: true,
+      userId: true,
+      institutionId: true,
+      name: true,
+      masterInput: true,
+    },
+  });
+
+  requireCondition(
+    preflight &&
+    preflight.id === temporaryProject.id &&
+    preflight.userId === temporaryProject.userId &&
+    preflight.institutionId === temporaryProject.institutionId &&
+    preflight.userId === owner.id &&
+    preflight.institutionId === tenant.id &&
+    preflight.name === 'B05 Temporary HTTP Project' &&
+    (preflight.masterInput as any)?.fixtureMarker === fixture.marker,
+    'Project sementara tidak cocok dengan identitas fixture; penghapusan ditolak.'
+  );
+
+  const deleted = await request(
+    'DELETE',
+    `/api/tenant/projects/${temporaryProject.id}`,
+    authOptions(
+      temporaryProjectOwnerSession,
+      tenant.id
+    )
+  );
+
+  requireCondition(
+    deleted.status === 200 &&
+    deleted.body?.success === true,
+    'Penghapusan project sementara melalui API gagal.'
+  );
+
+  const remaining = await prisma.project.findUnique({
+    where: {
+      id: temporaryProject.id,
+    },
+    select: {
+      id: true,
+    },
+  });
+
+  requireCondition(
+    remaining === null,
+    'Project sementara masih ditemukan setelah penghapusan API.'
+  );
+
+  console.log(
+    'TEMPORARY PROJECT REMOVED AND VERIFIED.'
+  );
+
+  temporaryProject = undefined;
+  temporaryProjectOwnerSession = undefined;
+}
+
+async function main(): Promise<void> {
+  console.log(
+    '=== B-05 TENANT ISOLATION HTTP TEST ==='
+  );
+
+  console.log(
+    'Database target: edutaktis_onboarding_test'
+  );
+
+  console.log(
+    `Test server port: ${SERVER_PORT}`
+  );
+
+  const {
+    databaseUrl,
+    password,
+  } = validateEnvironment();
+
+  await assertPortAvailable(SERVER_PORT);
+
+  try {
+    const dbModule =
+      await import('./onboarding-test-prisma');
+
+    prisma = dbModule.prisma;
+
+    fixtureModule =
+      await import('./fixture-b05-tenant');
+
+    fixture = await fixtureModule.createB05TenantFixture(
+      prisma,
+      password
+    );
+
+    console.log('B05 FIXTURE CREATED.');
+
+    await startTestServer(databaseUrl);
+
+    await runTests(password);
+  } catch (error) {
+    recordFailure(
+      error instanceof Error
+        ? error.message
+        : 'Unknown test error'
+    );
+  } finally {
+    // Hapus project sementara terlebih dahulu.
+    // Hanya dilakukan jika status cleanup masih aman.
+    if (temporaryProject && cleanupSafe) {
+      try {
+        await removeTemporaryProject();
+      } catch (error) {
+        cleanupSafe = false;
+        cleanupFailed = true;
+
+        recordFailure(
+          'Penghapusan project sementara gagal: ' +
+          `${
+            error instanceof Error
+              ? error.message
+              : 'unknown error'
+          }`
+        );
+      }
+    }
+
+    // Server harus berhenti secara normal
+    // sebelum fixture utama boleh dibersihkan.
+    try {
+      await stopTestServer();
+    } catch (error) {
+      cleanupSafe = false;
+      cleanupFailed = true;
+
+      recordFailure(
+        'Server shutdown gagal: ' +
+        `${
+          error instanceof Error
+            ? error.message
+            : 'unknown error'
+        }`
+      );
+    }
+
+    // Fixture hanya boleh dibersihkan jika
+    // proses server sudah dipastikan aman.
+    if (
+      fixture &&
+      prisma &&
+      fixtureModule &&
+      cleanupSafe
+    ) {
+      try {
+        await fixtureModule.cleanupB05TenantFixture(
+          prisma,
+          fixture
+        );
+
+        console.log(
+          'B05 FIXTURE CLEANUP: berhasil.'
+        );
+      } catch (error) {
+        cleanupFailed = true;
+
+        recordFailure(
+          'Fixture cleanup gagal: ' +
+          `${
+            error instanceof Error
+              ? error.message
+              : 'unknown error'
+          }`
+        );
+      }
+    } else if (fixture) {
+      cleanupFailed = true;
+
+      console.error(
+        'B05 FIXTURE CLEANUP DITAHAN. ' +
+        'Data dipertahankan untuk pemeriksaan.'
+      );
+    }
+
+    // Prisma tetap dicoba disconnect,
+    // termasuk jika proses fixture import gagal.
+    if (prisma) {
+      try {
+        await prisma.$disconnect();
+
+        console.log(
+          'TEST DATABASE DISCONNECTED.'
+        );
+      } catch {
+        cleanupFailed = true;
+
+        recordFailure(
+          'Prisma disconnect gagal.'
+        );
+      }
+    }
+  }
+
+  if (
+    failures.length > 0 ||
+    cleanupFailed
+  ) {
+    throw new Error(
+      `B-05 FAILED. ` +
+      `Passed: ${passed}. ` +
+      `Failures: ${failures.length}. ` +
+      `Cleanup safe: ${cleanupSafe}.`
+    );
+  }
+
+  console.log('');
+  console.log('======================================');
+
+  console.log(
+    `B-05 HTTP TEST PASSED: ${passed} assertions.`
+  );
+
+  console.log(
+    'Fixture sudah dibersihkan.'
+  );
+
+  console.log(
+    'Tidak ada perubahan skema database.'
+  );
+
+  console.log('======================================');
+}
+
+main().catch((error: unknown) => {
+  console.error(
+    'B-05 HTTP TEST STOPPED:',
+    error instanceof Error
+      ? error.message
+      : 'Unknown error'
+  );
+
+  if (serverOutput) {
+    console.error(
+      'SERVER OUTPUT (last lines):'
+    );
+
+    console.error(
+      serverOutput
+        .split('\n')
+        .slice(-35)
+        .join('\n')
+    );
+  }
+
+  process.exitCode = 1;
+});

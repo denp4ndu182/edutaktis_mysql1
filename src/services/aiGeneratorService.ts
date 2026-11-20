@@ -2,21 +2,8 @@ import {
   DocumentType,
   MasterInputData,
   Project,
-  AcpData,
-  TpData,
-  AtpData,
-  ProtaData,
-  ProsemData,
-  KktpData,
 } from '../types';
-import {
-  generateDeterministicACP,
-  generateDeterministicTP,
-  generateDeterministicATP,
-  generateDeterministicPROTA,
-  generateDeterministicPROSEM,
-  generateDeterministicKKTP,
-} from './defaultData';
+import { secureFetch } from './authClient';
 
 export interface PrerequisiteCheck {
   allowed: boolean;
@@ -100,80 +87,52 @@ export function checkPrerequisites(
   }
 }
 
-// Generate document using Server API or reliable deterministic engine
+// Generate document exclusively through the secured backend API.
 export async function executeDocumentGeneration(
   docType: DocumentType,
   masterInput: MasterInputData,
   documents: Project['documents']
 ): Promise<{ content: any; source: 'gemini_ai' | 'algorithmic_engine' }> {
-  try {
-    const response = await fetch('/api/generate-document', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        docType,
-        masterInput,
-        previousDocs: {
-          ACP: documents.ACP,
-          TP: documents.TP,
-          ATP: documents.ATP,
-          PROTA: documents.PROTA,
-          PROSEM: documents.PROSEM,
-          KKTP: documents.KKTP,
-        },
-      }),
-    });
+  const response = await secureFetch('/api/generate-document', {
+    method: 'POST',
+    body: JSON.stringify({
+      docType,
+      masterInput,
+      previousDocs: {
+        ACP: documents.ACP,
+        TP: documents.TP,
+        ATP: documents.ATP,
+        PROTA: documents.PROTA,
+        PROSEM: documents.PROSEM,
+        KKTP: documents.KKTP,
+      },
+    }),
+  });
 
-    if (response.ok) {
-      const result = await response.json();
-      if (result.success && result.data) {
-        return { content: result.data, source: 'gemini_ai' };
-      }
-    }
-  } catch (err) {
-    console.warn('Backend Gemini API call encountered error, using pedagogical algorithm:', err);
+  const result = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    const message =
+      typeof result?.error === 'string'
+        ? result.error
+        : `Permintaan generator gagal (HTTP ${response.status}).`;
+
+    throw new Error(message);
   }
 
-  // Algorithmic high-precision engine fallback
-  let generatedContent: any;
-  switch (docType) {
-    case 'ACP':
-      generatedContent = generateDeterministicACP(masterInput);
-      break;
-    case 'TP':
-      generatedContent = generateDeterministicTP(masterInput, documents.ACP.content as AcpData);
-      break;
-    case 'ATP':
-      const tpData = (documents.TP.content as TpData) || generateDeterministicTP(masterInput);
-      generatedContent = generateDeterministicATP(masterInput, tpData);
-      break;
-    case 'PROTA':
-      const atpData =
-        (documents.ATP.content as AtpData) ||
-        generateDeterministicATP(
-          masterInput,
-          (documents.TP.content as TpData) || generateDeterministicTP(masterInput)
-        );
-      generatedContent = generateDeterministicPROTA(masterInput, atpData);
-      break;
-    case 'PROSEM':
-      const protaData =
-        (documents.PROTA.content as ProtaData) ||
-        generateDeterministicPROTA(
-          masterInput,
-          (documents.ATP.content as AtpData) ||
-            generateDeterministicATP(
-              masterInput,
-              (documents.TP.content as TpData) || generateDeterministicTP(masterInput)
-            )
-        );
-      generatedContent = generateDeterministicPROSEM(masterInput, protaData);
-      break;
-    case 'KKTP':
-      const kktpTp = (documents.TP.content as TpData) || generateDeterministicTP(masterInput);
-      generatedContent = generateDeterministicKKTP(masterInput, kktpTp);
-      break;
+  if (!result || result.success !== true || !result.data) {
+    throw new Error('Respons generator dari server tidak valid.');
   }
 
-  return { content: generatedContent, source: 'algorithmic_engine' };
+  if (
+    result.source !== 'gemini_ai' &&
+    result.source !== 'algorithmic_engine'
+  ) {
+    throw new Error('Sumber hasil generator dari server tidak dikenal.');
+  }
+
+  return {
+    content: result.data,
+    source: result.source,
+  };
 }

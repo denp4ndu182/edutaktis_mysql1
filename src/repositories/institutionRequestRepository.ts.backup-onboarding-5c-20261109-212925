@@ -1,0 +1,87 @@
+import {
+  InstitutionRequest,
+  InstitutionRequestStatus,
+  Prisma,
+} from '@prisma/client';
+import { prisma } from '../db/prisma';
+
+type DbClient = Prisma.TransactionClient;
+
+export class InstitutionRequestRepository {
+  async create(
+    tx: DbClient,
+    data: Prisma.InstitutionRequestCreateInput
+  ): Promise<InstitutionRequest> {
+    return tx.institutionRequest.create({ data });
+  }
+
+  async findById(
+    tx: DbClient,
+    id: string
+  ): Promise<InstitutionRequest | null> {
+    return tx.institutionRequest.findUnique({ where: { id } });
+  }
+
+  async findPendingByNpsn(
+    tx: DbClient,
+    npsn: string
+  ): Promise<InstitutionRequest | null> {
+    return tx.institutionRequest.findFirst({
+      where: {
+        npsn: npsn.trim(),
+        status: InstitutionRequestStatus.PENDING_REVIEW,
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  async listByRequester(
+    tx: DbClient,
+    requesterUserId: string,
+    take = 25,
+    skip = 0
+  ): Promise<InstitutionRequest[]> {
+    const safeTake = Math.min(Math.max(take, 1), 100);
+    const safeSkip = Math.max(skip, 0);
+
+    return tx.institutionRequest.findMany({
+      where: { requesterUserId },
+      orderBy: { createdAt: 'desc' },
+      take: safeTake,
+      skip: safeSkip,
+    });
+  }
+
+  async listPending(
+    tx: DbClient,
+    take = 25,
+    skip = 0
+  ): Promise<InstitutionRequest[]> {
+    const safeTake = Math.min(Math.max(take, 1), 100);
+    const safeSkip = Math.max(skip, 0);
+
+    return tx.institutionRequest.findMany({
+      where: { status: InstitutionRequestStatus.PENDING_REVIEW },
+      orderBy: { createdAt: 'asc' },
+      take: safeTake,
+      skip: safeSkip,
+    });
+  }
+
+  async transitionStatus(
+    tx: DbClient,
+    id: string,
+    expectedStatus: InstitutionRequestStatus,
+    data: Prisma.InstitutionRequestUpdateManyMutationInput
+  ): Promise<number> {
+    const result = await tx.institutionRequest.updateMany({
+      where: { id, status: expectedStatus },
+      data,
+    });
+
+    return result.count;
+  }
+}
+
+export const institutionRequestRepository =
+  new InstitutionRequestRepository();

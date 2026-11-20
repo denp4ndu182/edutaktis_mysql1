@@ -1,0 +1,158 @@
+[1mdiff --git a/prisma/schema.prisma b/prisma/schema.prisma[m
+[1mindex 3df9f4a..fa0a92e 100644[m
+[1m--- a/prisma/schema.prisma[m
+[1m+++ b/prisma/schema.prisma[m
+[36m@@ -21,6 +21,19 @@[m [menum MembershipStatus {[m
+   INACTIVE[m
+ }[m
+ [m
+[32m+[m
+[32m+[m[32menum InstitutionRequestStatus {[m
+[32m+[m[32m  PENDING_REVIEW[m
+[32m+[m[32m  APPROVED[m
+[32m+[m[32m  REJECTED[m
+[32m+[m[32m  CANCELLED[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32menum GeneratorUsageScope {[m
+[32m+[m[32m  IP[m
+[32m+[m[32m  USER[m
+[32m+[m[32m}[m
+[32m+[m
+ model User {[m
+   id                      String    @id @default(uuid()) @db.VarChar(36)[m
+   email                   String    @unique @db.VarChar(255)[m
+[36m@@ -36,7 +49,7 @@[m [mmodel User {[m
+   isActive                Boolean   @default(true) @map("is_active")[m
+   emailVerified           Boolean   @default(false) @map("email_verified")[m
+   createdAt               DateTime  @default(now()) @map("created_at")[m
+[31m-  updatedAt               DateTime  @updatedAt @map("updated_at")[m
+[32m+[m[32m  updatedAt               DateTime  @default(now()) @updatedAt @map("updated_at")[m
+ [m
+   // Relations[m
+   memberships             InstitutionMembership[][m
+[36m@@ -44,6 +57,9 @@[m [mmodel User {[m
+   auditLogs               AuditLog[][m
+   sessions                UserSession[][m
+   passwordResetTokens     PasswordResetToken[][m
+[32m+[m[32m  institutionRequestsSubmitted InstitutionRequest[] @relation("InstitutionRequestRequester")[m
+[32m+[m[32m  institutionRequestsReviewed  InstitutionRequest[] @relation("InstitutionRequestReviewer")[m
+[32m+[m[32m  generatorExecutionLock GeneratorExecutionLock?[m
+ [m
+   @@map("users")[m
+ }[m
+[36m@@ -70,12 +86,13 @@[m [mmodel Institution {[m
+   nipKepala        String?   @map("nip_kepala") @db.VarChar(30)[m
+   kotaTandaTangan  String?   @map("kota_tanda_tangan") @db.VarChar(100)[m
+   createdAt        DateTime  @default(now()) @map("created_at")[m
+[31m-  updatedAt        DateTime  @updatedAt @map("updated_at")[m
+[32m+[m[32m  updatedAt        DateTime  @default(now()) @updatedAt @map("updated_at")[m
+ [m
+   // Relations[m
+   memberships      InstitutionMembership[][m
+   projects         Project[][m
+   auditLogs        AuditLog[][m
+[32m+[m[32m  institutionRequest InstitutionRequest?[m
+ [m
+   @@map("institutions")[m
+ }[m
+[36m@@ -87,7 +104,7 @@[m [mmodel InstitutionMembership {[m
+   role          InstitutionRole  @default(TEACHER)[m
+   status        MembershipStatus @default(ACTIVE)[m
+   joinedAt      DateTime         @default(now()) @map("joined_at")[m
+[31m-  updatedAt     DateTime         @updatedAt @map("updated_at")[m
+[32m+[m[32m  updatedAt     DateTime         @default(now()) @updatedAt @map("updated_at")[m
+ [m
+   // Relations[m
+   user          User             @relation(fields: [userId], references: [id], onDelete: Restrict)[m
+[36m@@ -100,6 +117,45 @@[m [mmodel InstitutionMembership {[m
+   @@map("institution_memberships")[m
+ }[m
+ [m
+[32m+[m[32mmodel InstitutionRequest {[m
+[32m+[m[32m  id              String                    @id @default(uuid()) @db.VarChar(36)[m
+[32m+[m[32m  requesterUserId String                    @map("requester_user_id") @db.VarChar(36)[m
+[32m+[m
+[32m+[m[32m  npsn             String                   @db.VarChar(20)[m
+[32m+[m[32m  namaResmi        String                   @map("nama_resmi") @db.VarChar(255)[m
+[32m+[m[32m  namaSingkat      String                   @map("nama_singkat") @db.VarChar(100)[m
+[32m+[m[32m  jenjang          String                   @db.VarChar(20)[m
+[32m+[m[32m  jenisInstitusi   String                   @map("jenis_institusi") @db.VarChar(20)[m
+[32m+[m[32m  kementerianDinas String                   @map("kementerian_dinas") @db.VarChar(255)[m
+[32m+[m[32m  alamatLengkap    String                   @map("alamat_lengkap") @db.Text[m
+[32m+[m[32m  kelurahanDesa    String?                  @map("kelurahan_desa") @db.VarChar(100)[m
+[32m+[m[32m  kecamatan        String?                  @db.VarChar(100)[m
+[32m+[m[32m  kabupatenKota    String                   @map("kabupaten_kota") @db.VarChar(100)[m
+[32m+[m[32m  provinsi         String                   @db.VarChar(100)[m
+[32m+[m[32m  kodePos          String?                  @map("kode_pos") @db.VarChar(20)[m
+[32m+[m[32m  telepon          String?                  @db.VarChar(50)[m
+[32m+[m[32m  email            String?                  @db.VarChar(255)[m
+[32m+[m[32m  website          String?                  @db.VarChar(255)[m
+[32m+[m
+[32m+[m[32m  status           InstitutionRequestStatus @default(PENDING_REVIEW)[m
+[32m+[m[32m  institutionId    String?                  @unique @map("institution_id") @db.VarChar(36)[m
+[32m+[m[32m  reviewedBy       String?                  @map("reviewed_by") @db.VarChar(36)[m
+[32m+[m[32m  reviewedAt       DateTime?                @map("reviewed_at")[m
+[32m+[m[32m  rejectionReason  String?                  @map("rejection_reason") @db.Text[m
+[32m+[m
+[32m+[m[32m  createdAt        DateTime                 @default(now()) @map("created_at")[m
+[32m+[m[32m  updatedAt        DateTime                 @default(now()) @updatedAt @map("updated_at")[m
+[32m+[m
+[32m+[m[32m  requester        User                     @relation("InstitutionRequestRequester", fields: [requesterUserId], references: [id], onDelete: Restrict)[m
+[32m+[m[32m  reviewer         User?                    @relation("InstitutionRequestReviewer", fields: [reviewedBy], references: [id], onDelete: SetNull)[m
+[32m+[m[32m  institution      Institution?             @relation(fields: [institutionId], references: [id], onDelete: Restrict)[m
+[32m+[m
+[32m+[m[32m  @@index([requesterUserId, status])[m
+[32m+[m[32m  @@index([npsn, status])[m
+[32m+[m[32m  @@index([status, createdAt])[m
+[32m+[m[32m  @@map("institution_requests")[m
+[32m+[m[32m}[m
+[32m+[m
+ model Project {[m
+   id            String       @id @default(uuid()) @db.VarChar(36)[m
+   institutionId String       @map("institution_id") @db.VarChar(36)[m
+[36m@@ -108,7 +164,7 @@[m [mmodel Project {[m
+   masterInput   Json         @map("master_input")[m
+   documents     Json?        @map("documents")[m
+   createdAt     DateTime     @default(now()) @map("created_at")[m
+[31m-  updatedAt     DateTime     @updatedAt @map("updated_at")[m
+[32m+[m[32m  updatedAt     DateTime     @default(now()) @updatedAt @map("updated_at")[m
+ [m
+   // Relations[m
+   institution   Institution           @relation(fields: [institutionId], references: [id], onDelete: Restrict)[m
+[36m@@ -178,3 +234,35 @@[m [mmodel PasswordResetToken {[m
+   @@index([expiresAt])[m
+   @@map("password_reset_tokens")[m
+ }[m
+[32m+[m
+[32m+[m
+[32m+[m[32mmodel GeneratorUsageCounter {[m
+[32m+[m[32m  id            String              @id @default(uuid()) @db.VarChar(36)[m
+[32m+[m[32m  scope         GeneratorUsageScope[m
+[32m+[m[32m  keyHash       String              @map("key_hash") @db.Char(64)[m
+[32m+[m[32m  windowSeconds Int                 @map("window_seconds") @db.UnsignedInt[m
+[32m+[m[32m  windowStart   DateTime            @map("window_start") @db.DateTime(3)[m
+[32m+[m[32m  windowEnd     DateTime            @map("window_end") @db.DateTime(3)[m
+[32m+[m[32m  usageCount    Int                 @default(0) @map("usage_count") @db.UnsignedInt[m
+[32m+[m[32m  createdAt     DateTime            @default(now()) @map("created_at") @db.DateTime(3)[m
+[32m+[m[32m  updatedAt     DateTime            @default(now()) @updatedAt @map("updated_at") @db.DateTime(3)[m
+[32m+[m
+[32m+[m[32m  @@unique([scope, keyHash, windowSeconds, windowStart], map: "generator_usage_counters_window_key")[m
+[32m+[m[32m  @@index([windowEnd], map: "generator_usage_counters_window_end_idx")[m
+[32m+[m[32m  @@map("generator_usage_counters")[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mmodel GeneratorExecutionLock {[m
+[32m+[m[32m  id         String   @id @default(uuid()) @db.VarChar(36)[m
+[32m+[m[32m  userId     String   @unique(map: "generator_execution_locks_user_id_key") @map("user_id") @db.VarChar(36)[m
+[32m+[m[32m  ownerToken String   @map("owner_token") @db.Char(64)[m
+[32m+[m[32m  acquiredAt DateTime @map("acquired_at") @db.DateTime(3)[m
+[32m+[m[32m  expiresAt  DateTime @map("expires_at") @db.DateTime(3)[m
+[32m+[m[32m  createdAt  DateTime @default(now()) @map("created_at") @db.DateTime(3)[m
+[32m+[m[32m  updatedAt  DateTime @default(now()) @updatedAt @map("updated_at") @db.DateTime(3)[m
+[32m+[m
+[32m+[m[32m  user User @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)[m
+[32m+[m
+[32m+[m[32m  @@index([expiresAt], map: "generator_execution_locks_expires_at_idx")[m
+[32m+[m[32m  @@map("generator_execution_locks")[m
+[32m+[m[32m}[m

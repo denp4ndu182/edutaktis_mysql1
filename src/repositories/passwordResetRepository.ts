@@ -80,6 +80,39 @@ export class PasswordResetRepository {
     }
   }
 
+  /**
+   * Strictly invalidate a token after an email delivery failure.
+   * Unlike markTokenUsed(), this method propagates database errors.
+   */
+  async invalidateToken(id: string): Promise<void> {
+    if (!this.isDbConfigured) {
+      for (const token of this.memTokens.values()) {
+        if (token.id === id) {
+          if (token.usedAt) {
+            throw new Error('Password reset token was already invalidated.');
+          }
+          token.usedAt = new Date();
+          return;
+        }
+      }
+      throw new Error('Password reset token was not found.');
+    }
+
+    const result = await prisma.passwordResetToken.updateMany({
+      where: {
+        id,
+        usedAt: null,
+      },
+      data: {
+        usedAt: new Date(),
+      },
+    });
+
+    if (result.count !== 1) {
+      throw new Error('Password reset token could not be invalidated.');
+    }
+  }
+
   async cleanupExpiredTokens(retentionDays = 7): Promise<number> {
     if (!this.isDbConfigured) {
       const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);

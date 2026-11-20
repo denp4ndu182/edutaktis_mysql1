@@ -1,12 +1,20 @@
+
 import { prisma } from '../db/prisma';
-import { Prisma, InstitutionMembership, InstitutionRole, MembershipStatus } from '@prisma/client';
+import {
+  Prisma,
+  Institution,
+  InstitutionMembership,
+  InstitutionRole,
+  MembershipStatus,
+} from '@prisma/client';
 
 export class MembershipRepository {
   async findByUserAndInstitution(
     userId: string,
-    institutionId: string
+    institutionId: string,
+    tx: Prisma.TransactionClient = prisma
   ): Promise<InstitutionMembership | null> {
-    return prisma.institutionMembership.findUnique({
+    return tx.institutionMembership.findUnique({
       where: {
         userId_institutionId: {
           userId,
@@ -16,34 +24,32 @@ export class MembershipRepository {
     });
   }
 
-  async listByUser(userId: string): Promise<
+  /**
+   * Mengambil seluruh membership milik pengguna.
+   *
+   * Semua status (ACTIVE, PENDING, INACTIVE) disertakan agar
+   * AuthService dapat membedakan status keanggotaan secara benar.
+   *
+   * Pengambilan data ini tidak memberikan hak akses tenant.
+   * Otorisasi tetap wajib memverifikasi status ACTIVE di server.
+   */
+  async listByUser(
+    userId: string
+  ): Promise<
     (InstitutionMembership & {
-      institution: {
-        id: string;
-        namaResmi: string;
-        namaSingkat: string;
-        npsn: string;
-        jenjang: string;
-      };
+      institution: Institution;
     })[]
   > {
     return prisma.institutionMembership.findMany({
       where: {
         userId,
-        status: MembershipStatus.ACTIVE,
       },
       include: {
-        institution: {
-          select: {
-            id: true,
-            namaResmi: true,
-            namaSingkat: true,
-            npsn: true,
-            jenjang: true,
-          },
-        },
+        institution: true,
       },
-      orderBy: { joinedAt: 'asc' },
+      orderBy: {
+        joinedAt: 'asc',
+      },
     });
   }
 
@@ -73,8 +79,49 @@ export class MembershipRepository {
     });
   }
 
-  async create(data: Prisma.InstitutionMembershipCreateInput): Promise<InstitutionMembership> {
-    return prisma.institutionMembership.create({
+  /**
+   * Mengambil permintaan membership yang masih menunggu persetujuan.
+   * Data dibatasi pada satu institusi dan hanya menampilkan profil aman.
+   */
+  async listPendingByInstitution(
+    institutionId: string,
+    tx: Prisma.TransactionClient,
+    take = 50,
+    skip = 0
+  ) {
+    return tx.institutionMembership.findMany({
+      where: {
+        institutionId,
+        status: MembershipStatus.PENDING,
+      },
+      select: {
+        id: true,
+        userId: true,
+        institutionId: true,
+        role: true,
+        status: true,
+        joinedAt: true,
+        updatedAt: true,
+        user: {
+          select: {
+            id: true,
+            namaLengkap: true,
+            email: true,
+            nip: true,
+          },
+        },
+      },
+      orderBy: { joinedAt: 'asc' },
+      take,
+      skip,
+    });
+  }
+
+  async create(
+    data: Prisma.InstitutionMembershipCreateInput,
+    tx: Prisma.TransactionClient = prisma
+  ): Promise<InstitutionMembership> {
+    return tx.institutionMembership.create({
       data,
     });
   }
@@ -109,6 +156,29 @@ export class MembershipRepository {
       },
       data: { status },
     });
+  }
+
+  /**
+   * Transisi status hanya jika membership masih PENDING.
+   * Wajib dipanggil menggunakan transaksi dari service.
+   * count = 1 berarti berhasil; count = 0 berarti sudah berubah/tidak ditemukan.
+   */
+  async transitionPendingStatus(
+    userId: string,
+    institutionId: string,
+    status: Extract<MembershipStatus, 'ACTIVE' | 'INACTIVE'>,
+    tx: Prisma.TransactionClient
+  ): Promise<number> {
+    const result = await tx.institutionMembership.updateMany({
+      where: {
+        userId,
+        institutionId,
+        status: MembershipStatus.PENDING,
+      },
+      data: { status },
+    });
+
+    return result.count;
   }
 }
 

@@ -34,7 +34,7 @@ export class AcademicMappingService {
   async mapAcademicSources(
     projectId: string,
     institutionId: string,
-    userId: string,
+    userId: string | undefined,
     input: TeacherGenerationInput
   ): Promise<AcademicMappingResult> {
     const project = await projectRepository.findProjectByIdAndInstitution(projectId, institutionId, userId);
