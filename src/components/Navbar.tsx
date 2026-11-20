@@ -187,7 +187,9 @@ export const Navbar: React.FC<NavbarProps> = ({
             <div className="text-[11px] space-y-1">
               <div className="flex items-center text-white font-extrabold truncate">
                 <School className="w-3.5 h-3.5 mr-1.5 shrink-0 text-cyan-200" />
-                <span className="truncate">{tenantContext.currentInstitution.namaSingkat}</span>
+                <span className="truncate">
+                  {tenantContext.currentInstitution?.namaSingkat || 'Belum Terhubung Institusi'}
+                </span>
               </div>
               <p className="text-white/90 text-[10px] font-medium truncate">
                 {tenantContext.currentUser.namaLengkap}

@@ -1,0 +1,23 @@
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: edutaktis-mysql-dev
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: devrootpass
+      MYSQL_DATABASE: edutaktis_dev
+      MYSQL_USER: dev
+      MYSQL_PASSWORD: devpass
+    ports:
+      - "127.0.0.1:3306:3306"
+    volumes:
+      - edutaktis_mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-udev", "-pdevpass"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  edutaktis_mysql_data:

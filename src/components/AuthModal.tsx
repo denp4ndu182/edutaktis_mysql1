@@ -421,7 +421,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                 <ShieldAlert className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
                 <div>
                   <strong className="block mb-0.5">Pemberitahuan Transparansi Infrastruktur:</strong>
-                  Layanan pengiriman email SMTP sedang dalam proses penyetelan pada server VPS Hostinger. Permintaan token reset akan dicatat secara kriptografis pada audit log server.
+                  Jika alamat email terdaftar, EduTaktis akan mengirimkan tautan reset password. Periksa kotak masuk atau folder spam Anda. Tautan berlaku selama 60 menit.
                 </div>
               </div>
 

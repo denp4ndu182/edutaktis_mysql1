@@ -1,6 +1,15 @@
+import {
+  withSuperAdminGuard,
+  assertSuperAdminInvariant,
+} from './superAdminGuard';
 import { hashPassword, verifyPassword, validatePasswordStrength, normalizeEmail, isValidEmail } from './password';
 import { generateSecureToken, hashToken, SESSION_DURATION_MS } from './tokens';
-import { authRateLimiter, registerRateLimiter } from './rateLimiter';
+import {
+  authRateLimiter,
+  registerRateLimiter,
+  passwordResetRequestRateLimiter,
+  passwordResetAttemptRateLimiter,
+} from './rateLimiter';
 import { sessionRepository } from '../repositories/sessionRepository';
 import { userRepository } from '../repositories/userRepository';
 import { membershipRepository } from '../repositories/membershipRepository';
@@ -8,6 +17,9 @@ import { institutionRepository } from '../repositories/institutionRepository';
 import { auditLogRepository } from '../repositories/auditLogRepository';
 import { passwordResetRepository } from '../repositories/passwordResetRepository';
 import { InstitutionRole, MembershipStatus } from '@prisma/client';
+import { prisma } from '../db/prisma';
+import { toSafeUserProfile } from './userDto';
+import { sendPasswordResetEmail } from '../services/emailService';
 
 export interface AuthenticatedUser {
   id: string;
@@ -93,7 +105,14 @@ interface MemoryResetToken {
 class AuthService {
   private isProduction = process.env.NODE_ENV === 'production';
   private isDbConfigured = Boolean(process.env.DATABASE_URL);
-  private allowDevFallback = process.env.ALLOW_DEV_FALLBACK === 'true' || !this.isProduction;
+
+  // Token reset hanya boleh dikembalikan oleh automated test yang secara
+  // eksplisit berjalan dengan NODE_ENV=test dan opt-in environment variable.
+  // Dalam development biasa maupun production, token tidak pernah dikirim
+  // melalui respons API, termasuk ketika aplikasi memakai database.
+  private allowSimulatedResetToken =
+    process.env.NODE_ENV === 'test' &&
+    process.env.ALLOW_SIMULATED_RESET_TOKEN === 'true';
 
   // In-memory store mirroring DB schemas for dev/test environments with identical Argon2id & SHA-256 security
   private memUsers: Map<string, MemoryUser> = new Map();
@@ -348,6 +367,9 @@ class AuthService {
     ipAddress?: string,
     userAgent?: string
   ): Promise<{ success: boolean; session?: AuthSessionData; error?: string; retryAfterSeconds?: number }> {
+    if (!this.isDbConfigured) {
+      throw new Error('DATABASE_URL wajib tersedia untuk login.');
+    }
     this.checkProductionDatabase();
 
     const email = normalizeEmail(emailInput);
@@ -369,19 +391,7 @@ class AuthService {
     }
 
     try {
-      let user: any = null;
-
-      if (this.isDbConfigured) {
-        user = await userRepository.findByEmail(email);
-      } else {
-        await this.ensureInitialized();
-        for (const u of this.memUsers.values()) {
-          if (u.email === email) {
-            user = u;
-            break;
-          }
-        }
-      }
+      const user = await userRepository.findByEmail(email);
 
       // Generic failure message to prevent email enumeration attacks
       const GENERIC_ERROR = 'Email atau password yang Anda masukkan tidak valid.';
@@ -438,30 +448,14 @@ class AuthService {
       const tokenHash = hashToken(rawToken);
       const expiresAt = new Date(Date.now() + SESSION_DURATION_MS);
 
-      let sessionId = `sess_${Date.now()}`;
-      if (this.isDbConfigured) {
-        const dbSession = await sessionRepository.createSession({
-          userId: user.id,
-          tokenHash,
-          expiresAt,
-          ipAddress,
-          userAgent,
-        });
-        sessionId = dbSession.id;
-      } else {
-        const memSession: MemorySession = {
-          id: sessionId,
-          userId: user.id,
-          tokenHash,
-          expiresAt,
-          revokedAt: null,
-          ipAddress,
-          userAgent,
-          lastUsedAt: new Date(),
-          createdAt: new Date(),
-        };
-        this.memSessions.set(tokenHash, memSession);
-      }
+      const dbSession = await sessionRepository.createSession({
+        userId: user.id,
+        tokenHash,
+        expiresAt,
+        ipAddress,
+        userAgent,
+      });
+      const sessionId = dbSession.id;
 
       // 5. Audit log successful login
       await auditLogRepository.logAction({
@@ -497,8 +491,7 @@ class AuthService {
       };
     } catch (err: any) {
       console.error('Login process error:', err);
-      if (this.isProduction) throw err;
-      return { success: false, error: 'Terjadi kesalahan sistem saat memproses login.' };
+      throw err;
     }
   }
 
@@ -523,6 +516,9 @@ class AuthService {
     ipAddress?: string,
     userAgent?: string
   ): Promise<{ success: boolean; session?: AuthSessionData; error?: string }> {
+    if (!this.isDbConfigured) {
+      throw new Error('DATABASE_URL wajib tersedia untuk pendaftaran.');
+    }
     this.checkProductionDatabase();
 
     const email = normalizeEmail(params.email);
@@ -551,18 +547,7 @@ class AuthService {
 
     try {
       // 1. Check existing email
-      let existingUser: any = null;
-      if (this.isDbConfigured) {
-        existingUser = await userRepository.findByEmail(email);
-      } else {
-        await this.ensureInitialized();
-        for (const u of this.memUsers.values()) {
-          if (u.email === email) {
-            existingUser = u;
-            break;
-          }
-        }
-      }
+      const existingUser = await userRepository.findByEmail(email);
 
       if (existingUser) {
         registerRateLimiter.registerFailure(rateLimitKey);
@@ -575,117 +560,73 @@ class AuthService {
       let targetInstitutionId: string | null = null;
       if (params.npsn) {
         const cleanNpsn = params.npsn.trim();
-        if (this.isDbConfigured) {
-          const inst = await institutionRepository.findByNpsn(cleanNpsn);
-          if (inst) targetInstitutionId = inst.id;
-        } else {
-          for (const inst of this.memInstitutions.values()) {
-            if (inst.npsn === cleanNpsn) {
-              targetInstitutionId = inst.id;
-              break;
-            }
-          }
-        }
+        const inst = await institutionRepository.findByNpsn(cleanNpsn);
+        if (inst) targetInstitutionId = inst.id;
       }
 
-      // 3. Create user
-      // CRITICAL HARDENING: Membership status is PENDING, preventing unauthorized access without approval.
-      let createdUser: any = null;
-      if (this.isDbConfigured) {
-        createdUser = await userRepository.create({
-          email,
-          passwordHash,
-          namaLengkap: params.namaLengkap.trim(),
-          gelarDepan: params.gelarDepan?.trim() || null,
-          gelarBelakang: params.gelarBelakang?.trim() || null,
-          nip: params.nip?.trim() || null,
-          nuptk: params.nuptk?.trim() || null,
-          nomorTelepon: params.nomorTelepon?.trim() || null,
-          preferensiMataPelajaran: params.preferensiMataPelajaran?.trim() || null,
-          isActive: true,
-          emailVerified: false,
-          ...(targetInstitutionId
-            ? {
-                memberships: {
-                  create: {
-                    institution: { connect: { id: targetInstitutionId } },
-                    role: InstitutionRole.TEACHER,
-                    status: MembershipStatus.PENDING, // STRICT: Pending admin authorization
-                  },
-                },
-              }
-            : {}),
-        });
-      } else {
-        const newUserId = `usr_${Date.now()}`;
-        createdUser = {
-          id: newUserId,
-          email,
-          passwordHash,
-          namaLengkap: params.namaLengkap.trim(),
-          gelarDepan: params.gelarDepan?.trim() || null,
-          gelarBelakang: params.gelarBelakang?.trim() || null,
-          nip: params.nip?.trim() || null,
-          nuptk: params.nuptk?.trim() || null,
-          nomorTelepon: params.nomorTelepon?.trim() || null,
-          preferensiMataPelajaran: params.preferensiMataPelajaran?.trim() || null,
-          isActive: true,
-          emailVerified: false,
-          fotoProfilUrl: null,
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        };
-        this.memUsers.set(newUserId, createdUser);
-
-        if (targetInstitutionId) {
-          this.memMemberships.push({
-            id: `mem_${Date.now()}`,
-            userId: newUserId,
-            institutionId: targetInstitutionId,
-            role: 'TEACHER',
-            status: 'PENDING', // STRICT: Pending admin authorization
-            joinedAt: new Date(),
-          });
-        }
-      }
-
-      // 4. Create session for immediate auto-login
+      // 3. Prepare session token.
       const rawToken = generateSecureToken();
       const tokenHash = hashToken(rawToken);
       const expiresAt = new Date(Date.now() + SESSION_DURATION_MS);
-      let sessionId = `sess_${Date.now()}`;
 
-      if (this.isDbConfigured) {
-        const dbSession = await sessionRepository.createSession({
-          userId: createdUser.id,
-          tokenHash,
-          expiresAt,
-          ipAddress,
-          userAgent,
+      // 4. Create user, membership, session, and audit log atomically.
+      const { createdUser, dbSession } = await prisma.$transaction(async (tx) => {
+        const createdUser = await tx.user.create({
+          data: {
+            email,
+            passwordHash,
+            namaLengkap: params.namaLengkap.trim(),
+            gelarDepan: params.gelarDepan?.trim() || null,
+            gelarBelakang: params.gelarBelakang?.trim() || null,
+            nip: params.nip?.trim() || null,
+            nuptk: params.nuptk?.trim() || null,
+            nomorTelepon: params.nomorTelepon?.trim() || null,
+            preferensiMataPelajaran: params.preferensiMataPelajaran?.trim() || null,
+            isActive: true,
+            emailVerified: false,
+            ...(targetInstitutionId
+              ? {
+                  memberships: {
+                    create: {
+                      institution: { connect: { id: targetInstitutionId } },
+                      role: InstitutionRole.TEACHER,
+                      status: MembershipStatus.PENDING,
+                    },
+                  },
+                }
+              : {}),
+          },
         });
-        sessionId = dbSession.id;
-      } else {
-        this.memSessions.set(tokenHash, {
-          id: sessionId,
-          userId: createdUser.id,
-          tokenHash,
-          expiresAt,
-          revokedAt: null,
-          ipAddress,
-          userAgent,
-          lastUsedAt: new Date(),
-          createdAt: new Date(),
-        });
-      }
 
-      await auditLogRepository.logAction({
-        userId: createdUser.id,
-        institutionId: targetInstitutionId || undefined,
-        action: 'AUTH_REGISTER_SUCCESS',
-        resource: 'User',
-        details: { email, targetInstitutionId, membershipStatus: targetInstitutionId ? 'PENDING' : 'NONE' },
-        ipAddress,
+        const dbSession = await tx.userSession.create({
+          data: {
+            userId: createdUser.id,
+            tokenHash,
+            expiresAt,
+            ipAddress,
+            userAgent,
+          },
+        });
+
+        await tx.auditLog.create({
+          data: {
+            userId: createdUser.id,
+            institutionId: targetInstitutionId,
+            action: 'AUTH_REGISTER_SUCCESS',
+            resource: 'User',
+            details: {
+              email,
+              targetInstitutionId,
+              membershipStatus: targetInstitutionId ? 'PENDING' : 'NONE',
+            },
+            ipAddress,
+          },
+        });
+
+        return { createdUser, dbSession };
       });
+
+      const sessionId = dbSession.id;
 
       return {
         success: true,
@@ -708,10 +649,10 @@ class AuthService {
           expiresAt,
         },
       };
+
     } catch (err: any) {
       console.error('Registration error:', err);
-      if (this.isProduction) throw err;
-      return { success: false, error: 'Gagal memproses pendaftaran akun baru.' };
+      throw err;
     }
   }
 
@@ -723,50 +664,27 @@ class AuthService {
 
     const tokenHash = hashToken(rawToken);
 
-    if (this.isDbConfigured) {
-      const session = await sessionRepository.findValidSession(tokenHash);
-      if (!session) return null;
-
-      // Update last used timestamp asynchronously
-      sessionRepository.updateLastUsed(session.id).catch(() => {});
-
-      return {
-        id: session.user.id,
-        email: session.user.email,
-        namaLengkap: session.user.namaLengkap,
-        gelarDepan: session.user.gelarDepan,
-        gelarBelakang: session.user.gelarBelakang,
-        nip: session.user.nip,
-        nuptk: session.user.nuptk,
-        fotoProfilUrl: session.user.fotoProfilUrl,
-        isActive: session.user.isActive,
-      };
-    } else {
-      this.checkProductionDatabase();
-      await this.ensureInitialized();
-      const session = this.memSessions.get(tokenHash);
-      if (!session) return null;
-      if (session.revokedAt) return null;
-      if (new Date() > session.expiresAt) return null;
-
-      const user = this.memUsers.get(session.userId);
-      if (!user || !user.isActive) return null;
-
-      session.lastUsedAt = new Date();
-      return {
-        id: user.id,
-        email: user.email,
-        namaLengkap: user.namaLengkap,
-        gelarDepan: user.gelarDepan,
-        gelarBelakang: user.gelarBelakang,
-        nip: user.nip,
-        nuptk: user.nuptk,
-        nomorTelepon: user.nomorTelepon,
-        fotoProfilUrl: user.fotoProfilUrl,
-        preferensiMataPelajaran: user.preferensiMataPelajaran,
-        isActive: user.isActive,
-      };
+    if (!this.isDbConfigured) {
+      throw new Error('DATABASE_URL wajib tersedia untuk validasi sesi.');
     }
+
+    const session = await sessionRepository.findValidSession(tokenHash);
+    if (!session) return null;
+
+    // Best-effort update; failures are logged by the repository.
+    void sessionRepository.updateLastUsed(session.id);
+
+    return {
+      id: session.user.id,
+      email: session.user.email,
+      namaLengkap: session.user.namaLengkap,
+      gelarDepan: session.user.gelarDepan,
+      gelarBelakang: session.user.gelarBelakang,
+      nip: session.user.nip,
+      nuptk: session.user.nuptk,
+      fotoProfilUrl: session.user.fotoProfilUrl,
+      isActive: session.user.isActive,
+    };
   }
 
   /**
@@ -776,14 +694,11 @@ class AuthService {
     if (!rawToken) return;
     const tokenHash = hashToken(rawToken);
 
-    if (this.isDbConfigured) {
-      await sessionRepository.revokeByTokenHash(tokenHash);
-    } else {
-      const s = this.memSessions.get(tokenHash);
-      if (s) {
-        s.revokedAt = new Date();
-      }
+    if (!this.isDbConfigured) {
+      throw new Error('DATABASE_URL wajib tersedia untuk logout.');
     }
+
+    await sessionRepository.revokeByTokenHash(tokenHash);
 
     if (userId) {
       await auditLogRepository.logAction({
@@ -800,17 +715,11 @@ class AuthService {
    * Logout all sessions for a user.
    */
   async logoutAll(userId: string, ipAddress?: string): Promise<number> {
-    let count = 0;
-    if (this.isDbConfigured) {
-      count = await sessionRepository.revokeAllUserSessions(userId);
-    } else {
-      for (const s of this.memSessions.values()) {
-        if (s.userId === userId && !s.revokedAt) {
-          s.revokedAt = new Date();
-          count++;
-        }
-      }
+    if (!this.isDbConfigured) {
+      throw new Error('DATABASE_URL wajib tersedia untuk logout semua sesi.');
     }
+
+    const count = await sessionRepository.revokeAllUserSessions(userId);
 
     await auditLogRepository.logAction({
       userId,
@@ -823,9 +732,13 @@ class AuthService {
     return count;
   }
 
+
   /**
    * Retrieves tenant context strictly against server state.
-   * Only ACTIVE memberships are accepted for operational tenancy.
+   *
+   * All membership statuses are returned for visibility and status checks.
+   * Only ACTIVE membership can become the operational tenant context.
+   * An explicitly requested institution ID never falls back to another tenant.
    */
   async getUserTenantContext(userId: string, activeInstitutionId?: string) {
     if (this.isDbConfigured) {
@@ -833,68 +746,91 @@ class AuthService {
       if (!user) throw new Error('User not found');
 
       const memberships = await membershipRepository.listByUser(userId);
-      // Filter strictly active memberships
-      const activeMemberships = memberships.filter((m) => m.status === 'ACTIVE');
 
-      let activeMem = activeMemberships.find((m) => m.institutionId === activeInstitutionId);
-      if (!activeMem && activeMemberships.length > 0) {
-        activeMem = activeMemberships[0];
-      }
+      const activeMemberships = memberships.filter(
+        (membership) => membership.status === 'ACTIVE'
+      );
+
+      const activeMem =
+        activeInstitutionId === undefined
+          ? activeMemberships[0]
+          : activeMemberships.find(
+              (membership) =>
+                membership.institutionId === activeInstitutionId
+            );
 
       const activeInst = activeMem
-        ? await institutionRepository.findById(activeMem.institutionId)
+        ? activeMem.institution
         : null;
 
       return {
-        currentUser: user,
+        currentUser: toSafeUserProfile(user),
         currentMembership: activeMem || null,
-        currentInstitution: activeInst || null,
-        userInstitutions: activeMemberships.map((m) => ({
-          institution: m.institution,
+        currentInstitution: activeInst,
+        userInstitutions: memberships.map((membership) => ({
+          institution: membership.institution,
           membership: {
-            id: m.id,
-            userId: m.userId,
-            institutionId: m.institutionId,
-            role: m.role,
-            status: m.status,
-            joinedAt: m.joinedAt,
+            id: membership.id,
+            userId: membership.userId,
+            institutionId: membership.institutionId,
+            role: membership.role,
+            status: membership.status,
+            joinedAt: membership.joinedAt,
           },
         })),
       };
     } else {
       this.checkProductionDatabase();
       await this.ensureInitialized();
+
       const user = this.memUsers.get(userId);
       if (!user) throw new Error('User not found');
 
-      const userMems = this.memMemberships.filter(
-        (m) => m.userId === userId && m.status === 'ACTIVE'
+      const allUserMemberships = this.memMemberships.filter(
+        (membership) => membership.userId === userId
       );
 
-      let activeMem = userMems.find((m) => m.institutionId === activeInstitutionId);
-      if (!activeMem && userMems.length > 0) {
-        activeMem = userMems[0];
-      }
+      const activeMemberships = allUserMemberships.filter(
+        (membership) => membership.status === 'ACTIVE'
+      );
+
+      const activeMem =
+        activeInstitutionId === undefined
+          ? activeMemberships[0]
+          : activeMemberships.find(
+              (membership) =>
+                membership.institutionId === activeInstitutionId
+            );
 
       const activeInst = activeMem
         ? this.memInstitutions.get(activeMem.institutionId) || null
         : null;
 
-      const userInstitutions = userMems
-        .map((m) => {
-          const inst = this.memInstitutions.get(m.institutionId);
-          return inst ? { institution: inst, membership: m } : null;
+      const userInstitutions = allUserMemberships
+        .map((membership) => {
+          const institution = this.memInstitutions.get(
+            membership.institutionId
+          );
+
+          return institution
+            ? { institution, membership }
+            : null;
         })
-        .filter(Boolean);
+        .filter(
+          (
+            item
+          ): item is NonNullable<typeof item> => item !== null
+        );
 
       return {
-        currentUser: user,
+        currentUser: toSafeUserProfile(user),
         currentMembership: activeMem || null,
         currentInstitution: activeInst,
         userInstitutions,
       };
     }
   }
+
 
   /**
    * Request password reset token.
@@ -903,12 +839,35 @@ class AuthService {
   async requestPasswordReset(
     emailInput: string,
     ipAddress?: string
-  ): Promise<{ success: boolean; message: string; simulatedToken?: string }> {
+  ): Promise<{ success: boolean; message: string; simulatedToken?: string; retryAfterSeconds?: number }> {
     this.checkProductionDatabase();
 
+    const rateLimitKey = `password-reset-request:${ipAddress || 'unknown'}`;
+    const rateCheck = passwordResetRequestRateLimiter.isRateLimited(rateLimitKey);
+    if (rateCheck.limited) {
+      return {
+        success: false,
+        message: 'Terlalu banyak permintaan reset password. Silakan coba lagi nanti.',
+        retryAfterSeconds: rateCheck.retryAfterSeconds,
+      };
+    }
+    // Count every request, including unknown email addresses, to prevent
+    // email enumeration from changing rate-limit behavior.
+    const rateResult = passwordResetRequestRateLimiter.registerFailure(rateLimitKey);
+    if (rateResult.locked) {
+      return {
+        success: false,
+        message: 'Terlalu banyak permintaan reset password. Silakan coba lagi nanti.',
+        retryAfterSeconds: rateResult.retryAfterSeconds,
+      };
+    }
+
     const email = normalizeEmail(emailInput);
-    if (!email) {
-      return { success: false, message: 'Alamat email wajib diisi.' };
+    const neutralMessage =
+      'Jika alamat email terdaftar, permintaan reset password akan diproses.';
+
+    if (!email || !isValidEmail(email)) {
+      return { success: true, message: neutralMessage };
     }
 
     let user: any = null;
@@ -916,16 +875,13 @@ class AuthService {
       user = await userRepository.findByEmail(email);
     } else {
       await this.ensureInitialized();
-      for (const u of this.memUsers.values()) {
-        if (u.email === email) {
-          user = u;
+      for (const candidate of this.memUsers.values()) {
+        if (candidate.email === email) {
+          user = candidate;
           break;
         }
       }
     }
-
-    const neutralMessage =
-      'Jika email terdaftar, instruksi reset password telah diproses. Perlu dicatat: Layanan pengiriman email (SMTP) di server ini sedang dalam tahap konfigurasi VPS.';
 
     if (!user) {
       return { success: true, message: neutralMessage };
@@ -933,17 +889,20 @@ class AuthService {
 
     const rawToken = generateSecureToken();
     const tokenHash = hashToken(rawToken);
-    const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
+    let resetTokenId: string;
 
     if (this.isDbConfigured) {
-      await passwordResetRepository.createToken({
+      const createdToken = await passwordResetRepository.createToken({
         userId: user.id,
         tokenHash,
         expiresAt,
       });
+      resetTokenId = createdToken.id;
     } else {
+      resetTokenId = `rst_${Date.now()}`;
       this.memResetTokens.set(tokenHash, {
-        id: `rst_${Date.now()}`,
+        id: resetTokenId,
         userId: user.id,
         tokenHash,
         expiresAt,
@@ -956,32 +915,122 @@ class AuthService {
       userId: user.id,
       action: 'AUTH_PASSWORD_RESET_REQUESTED',
       resource: 'PasswordResetToken',
-      details: { email, expiresAt: expiresAt.toISOString() },
+      details: { expiresAt: expiresAt.toISOString() },
       ipAddress,
     });
 
-    // In dev / test mode only, allow returning simulatedToken for automated test harness
+    // Automated tests may explicitly request the simulated token.
+    // Normal development and production flows use email delivery.
+    if (!this.allowSimulatedResetToken) {
+      let emailSent = false;
+
+      try {
+        const appUrl = process.env.APP_URL;
+        if (!appUrl) {
+          throw new Error('APP_URL is not configured.');
+        }
+
+        const resetUrl = new URL('/reset-password', appUrl);
+        resetUrl.searchParams.set('token', rawToken);
+
+        await sendPasswordResetEmail({
+          recipient: user.email,
+          resetUrl: resetUrl.toString(),
+          expiresInMinutes: 60,
+        });
+
+        emailSent = true;
+      } catch (emailError) {
+        // Email delivery failed: invalidate the token before returning.
+        try {
+          if (this.isDbConfigured) {
+            await passwordResetRepository.invalidateToken(resetTokenId);
+          } else {
+            const storedToken = this.memResetTokens.get(tokenHash);
+            if (!storedToken || storedToken.usedAt) {
+              throw new Error('In-memory reset token could not be invalidated.');
+            }
+            storedToken.usedAt = new Date();
+          }
+        } catch {
+          console.error(
+            'CRITICAL: Password reset token invalidation failed after email delivery failure.'
+          );
+        }
+
+        console.error(
+          'Password reset email delivery failed:',
+          emailError instanceof Error ? emailError.name : 'UnknownError'
+        );
+
+        try {
+          await auditLogRepository.logAction({
+            userId: user.id,
+            action: 'AUTH_PASSWORD_RESET_EMAIL_FAILED',
+            resource: 'PasswordResetToken',
+            details: { reason: 'SMTP_DELIVERY_FAILED' },
+            ipAddress,
+          });
+        } catch {
+          console.error('Failed to record password reset email failure audit.');
+        }
+      }
+
+      if (emailSent) {
+        try {
+          await auditLogRepository.logAction({
+            userId: user.id,
+            action: 'AUTH_PASSWORD_RESET_EMAIL_SENT',
+            resource: 'PasswordResetToken',
+            details: { expiresAt: expiresAt.toISOString() },
+            ipAddress,
+          });
+        } catch {
+          // Delivery has succeeded; audit failure must not invalidate the emailed token.
+          console.error('Failed to record password reset email success audit.');
+        }
+      }
+    }
+
     return {
       success: true,
       message: neutralMessage,
-      ...(this.allowDevFallback ? { simulatedToken: rawToken } : {}),
+      ...(this.allowSimulatedResetToken ? { simulatedToken: rawToken } : {}),
     };
   }
 
   /**
-   * Complete password reset using token.
-   * Validates one-time token, expiration, hashes new password with Argon2id,
-   * updates password, and revokes all active sessions for the user.
+   * Complete password reset with a single-use token.
+   * In DB mode, token consumption, password update, session revocation,
+   * and success audit are committed atomically.
    */
   async resetPasswordWithToken(
     rawToken: string,
     newPasswordInput: string,
     ipAddress?: string
-  ): Promise<{ success: boolean; error?: string; message?: string }> {
+  ): Promise<{ success: boolean; error?: string; message?: string; retryAfterSeconds?: number }> {
     this.checkProductionDatabase();
 
-    if (!rawToken || typeof rawToken !== 'string') {
-      return { success: false, error: 'Token reset password tidak valid.' };
+    const rateLimitKey = `password-reset-attempt:${ipAddress || 'unknown'}`;
+    const rateCheck = passwordResetAttemptRateLimiter.isRateLimited(rateLimitKey);
+    if (rateCheck.limited) {
+      return {
+        success: false,
+        error: 'Terlalu banyak percobaan reset password. Silakan coba lagi nanti.',
+        retryAfterSeconds: rateCheck.retryAfterSeconds,
+      };
+    }
+    const rateResult = passwordResetAttemptRateLimiter.registerFailure(rateLimitKey);
+    if (rateResult.locked) {
+      return {
+        success: false,
+        error: 'Terlalu banyak percobaan reset password. Silakan coba lagi nanti.',
+        retryAfterSeconds: rateResult.retryAfterSeconds,
+      };
+    }
+
+    if (!rawToken || typeof rawToken !== 'string' || rawToken.length > 512) {
+      return { success: false, error: 'Token reset password tidak valid atau sudah kedaluwarsa.' };
     }
 
     const passCheck = validatePasswordStrength(newPasswordInput);
@@ -990,62 +1039,111 @@ class AuthService {
     }
 
     const tokenHash = hashToken(rawToken);
+    const now = new Date();
 
     try {
-      let tokenRecord: any = null;
-      let userId: string | null = null;
-
-      if (this.isDbConfigured) {
-        tokenRecord = await passwordResetRepository.findValidToken(tokenHash);
-        if (!tokenRecord) {
-          return { success: false, error: 'Token reset password tidak valid atau sudah kedaluwarsa.' };
-        }
-        userId = tokenRecord.userId;
-      } else {
-        tokenRecord = this.memResetTokens.get(tokenHash);
-        if (!tokenRecord) {
-          return { success: false, error: 'Token reset password tidak valid atau sudah kedaluwarsa.' };
-        }
-        if (tokenRecord.usedAt) {
-          return { success: false, error: 'Token reset password sudah pernah digunakan.' };
-        }
-        if (new Date() > tokenRecord.expiresAt) {
-          return { success: false, error: 'Token reset password telah kedaluwarsa.' };
-        }
-        userId = tokenRecord.userId;
-      }
-
-      // Hash new password using Argon2id
+      // Argon2id is intentionally computed before opening the DB transaction
+      // to keep row locks short-lived.
       const newHash = await hashPassword(newPasswordInput);
 
       if (this.isDbConfigured) {
-        await userRepository.update(userId!, { passwordHash: newHash });
-        await passwordResetRepository.markTokenUsed(tokenRecord.id);
-      } else {
-        const u = this.memUsers.get(userId!);
-        if (u) {
-          u.passwordHash = newHash;
-          u.updatedAt = new Date();
-        }
-        tokenRecord.usedAt = new Date();
+        await prisma.$transaction(async (tx) => {
+          const tokenRecord = await tx.passwordResetToken.findUnique({
+            where: { tokenHash },
+            select: { id: true, userId: true },
+          });
+
+          if (!tokenRecord) {
+            throw new Error('RESET_TOKEN_INVALID');
+          }
+
+          // Conditional update is the single-use claim. Concurrent requests
+          // race on this row; only one can change usedAt from NULL.
+          const claimed = await tx.passwordResetToken.updateMany({
+            where: {
+              id: tokenRecord.id,
+              userId: tokenRecord.userId,
+              tokenHash,
+              usedAt: null,
+              expiresAt: { gt: now },
+            },
+            data: { usedAt: now },
+          });
+
+          if (claimed.count !== 1) {
+            throw new Error('RESET_TOKEN_INVALID');
+          }
+
+          await tx.user.update({
+            where: { id: tokenRecord.userId },
+            data: { passwordHash: newHash },
+          });
+
+          const revoked = await tx.userSession.updateMany({
+            where: { userId: tokenRecord.userId, revokedAt: null },
+            data: { revokedAt: now },
+          });
+
+          // Do not use the best-effort auditLogRepository.logAction here:
+          // an audit failure must abort the security-sensitive transaction.
+          await tx.auditLog.create({
+            data: {
+              userId: tokenRecord.userId,
+              action: 'AUTH_PASSWORD_RESET_SUCCESS',
+              resource: 'User',
+              details: { sessionsRevoked: revoked.count },
+              ipAddress,
+            },
+          });
+
+          return { sessionsRevoked: revoked.count };
+        });
+
+        passwordResetAttemptRateLimiter.reset(rateLimitKey);
+        return {
+          success: true,
+          message: 'Password berhasil diubah. Seluruh sesi lama telah dicabut. Silakan login dengan password baru.',
+        };
       }
 
-      // CRITICAL: Revoke all existing sessions across all devices
-      await this.logoutAll(userId!, ipAddress);
+      // Development/test memory fallback. Production is required to use DB.
+      const tokenRecord = this.memResetTokens.get(tokenHash);
+      if (!tokenRecord || tokenRecord.usedAt || tokenRecord.expiresAt <= now) {
+        return { success: false, error: 'Token reset password tidak valid atau sudah kedaluwarsa.' };
+      }
+
+      const user = this.memUsers.get(tokenRecord.userId);
+      if (!user) {
+        return { success: false, error: 'Token reset password tidak valid atau sudah kedaluwarsa.' };
+      }
+
+      user.passwordHash = newHash;
+      user.updatedAt = now;
+      tokenRecord.usedAt = now;
+
+      for (const session of this.memSessions.values()) {
+        if (session.userId === user.id && !session.revokedAt) {
+          session.revokedAt = now;
+        }
+      }
 
       await auditLogRepository.logAction({
-        userId: userId!,
+        userId: user.id,
         action: 'AUTH_PASSWORD_RESET_SUCCESS',
         resource: 'User',
-        details: { tokenId: tokenRecord.id },
+        details: {},
         ipAddress,
       });
 
+      passwordResetAttemptRateLimiter.reset(rateLimitKey);
       return {
         success: true,
         message: 'Password berhasil diubah. Seluruh sesi lama telah dicabut. Silakan login dengan password baru.',
       };
     } catch (err: any) {
+      if (err?.message === 'RESET_TOKEN_INVALID') {
+        return { success: false, error: 'Token reset password tidak valid atau sudah kedaluwarsa.' };
+      }
       console.error('Reset password error:', err);
       if (this.isProduction) throw err;
       return { success: false, error: 'Gagal mengatur ulang password.' };
@@ -1059,6 +1157,18 @@ class AuthService {
    * - SCHOOL_ADMIN cannot grant SUPER_ADMIN.
    * - Action is strictly logged in audit log.
    */
+
+  /**
+   * Updates a membership role or status.
+   *
+   * Security rules:
+   * - Caller cannot change their own role.
+   * - SUPER_ADMIN cannot be granted through this endpoint.
+   * - Caller must have an active authorized membership.
+   * - The last active SUPER_ADMIN cannot be removed.
+   * - Database checks and mutations run in one SERIALIZABLE transaction.
+   */
+
   async updateMembership(params: {
     callerUserId: string;
     targetUserId: string;
@@ -1069,86 +1179,147 @@ class AuthService {
   }): Promise<{ success: boolean; error?: string }> {
     this.checkProductionDatabase();
 
-    if (params.callerUserId === params.targetUserId && params.newRole) {
-      return { success: false, error: 'Akses ditolak: Anda tidak dapat mengubah peran Anda sendiri.' };
+    if (!this.isDbConfigured) {
+      return {
+        success: false,
+        error: 'DATABASE_URL wajib tersedia untuk perubahan membership.',
+      };
     }
 
-    if (this.isDbConfigured) {
-      const callerMem = await membershipRepository.findByUserAndInstitution(params.callerUserId, params.institutionId);
-      if (!callerMem || callerMem.status !== 'ACTIVE') {
-        return { success: false, error: 'Akses ditolak: Keanggotaan pemanggil tidak aktif.' };
-      }
-
-      if (callerMem.role !== 'SUPER_ADMIN' && callerMem.role !== 'SCHOOL_ADMIN') {
-        return { success: false, error: 'Akses ditolak: Anda tidak memiliki izin mengelola anggota institusi ini.' };
-      }
-
-      if (params.newRole === 'SUPER_ADMIN' && callerMem.role !== 'SUPER_ADMIN') {
-        return { success: false, error: 'Akses ditolak: Hanya Super Admin yang berhak memberikan peran Super Admin.' };
-      }
-
-      if (params.newRole) {
-        await membershipRepository.updateRole(params.targetUserId, params.institutionId, params.newRole);
-      }
-      if (params.newStatus) {
-        await membershipRepository.updateStatus(params.targetUserId, params.institutionId, params.newStatus);
-      }
-    } else {
-      const callerMem = this.memMemberships.find(
-        (m) => m.userId === params.callerUserId && m.institutionId === params.institutionId && m.status === 'ACTIVE'
-      );
-      if (!callerMem || (callerMem.role !== 'SUPER_ADMIN' && callerMem.role !== 'SCHOOL_ADMIN')) {
-        return { success: false, error: 'Akses ditolak: Izin tidak mencukupi.' };
-      }
-
-      if (params.newRole === 'SUPER_ADMIN' && callerMem.role !== 'SUPER_ADMIN') {
-        return { success: false, error: 'Akses ditolak: Hanya Super Admin yang berhak memberikan peran Super Admin.' };
-      }
-
-      const targetMem = this.memMemberships.find(
-        (m) => m.userId === params.targetUserId && m.institutionId === params.institutionId
-      );
-      if (!targetMem) {
-        return { success: false, error: 'Target keanggotaan tidak ditemukan.' };
-      }
-
-      if (params.newRole) targetMem.role = params.newRole;
-      if (params.newStatus) targetMem.status = params.newStatus;
+    if (params.newRole === undefined && params.newStatus === undefined) {
+      return {
+        success: false,
+        error: 'Tidak ada perubahan membership yang diminta.',
+      };
     }
 
-    await auditLogRepository.logAction({
+    if (params.callerUserId === params.targetUserId) {
+      return {
+        success: false,
+        error: 'Akses ditolak: Anda tidak dapat mengubah membership sendiri.',
+      };
+    }
+
+    if (params.newRole === InstitutionRole.SUPER_ADMIN) {
+      return {
+        success: false,
+        error: 'Akses ditolak: Pemberian SUPER_ADMIN hanya melalui prosedur khusus.',
+      };
+    }
+
+    return withSuperAdminGuard(async (tx) => {
+      const callerMem = await tx.institutionMembership.findUnique({
+  where: {
+    userId_institutionId: {
       userId: params.callerUserId,
       institutionId: params.institutionId,
-      action: 'MEMBERSHIP_ROLE_UPDATED',
-      resource: 'InstitutionMembership',
-      details: {
+    },
+  },
+  select: {
+    role: true,
+    status: true,
+    user: {
+      select: {
+        isActive: true,
+      },
+    },
+  },
+});
+
+if (
+  !callerMem ||
+  callerMem.status !== MembershipStatus.ACTIVE ||
+  !callerMem.user.isActive
+) {
+  return {
+    success: false,
+    error: 'Akses ditolak: Akun atau keanggotaan pemanggil tidak aktif.',
+  };
+}
+
+      if (
+        callerMem.role !== InstitutionRole.SUPER_ADMIN &&
+        callerMem.role !== InstitutionRole.SCHOOL_ADMIN
+      ) {
+        return {
+          success: false,
+          error: 'Akses ditolak: Anda tidak memiliki izin mengelola anggota institusi ini.',
+        };
+      }
+
+      const targetMem = await tx.institutionMembership.findUnique({
+        where: {
+          userId_institutionId: {
+            userId: params.targetUserId,
+            institutionId: params.institutionId,
+          },
+        },
+        select: {
+          id: true,
+          role: true,
+          status: true,
+        },
+      });
+
+      if (!targetMem) {
+        return {
+          success: false,
+          error: 'Target keanggotaan tidak ditemukan.',
+        };
+      }
+
+      await assertSuperAdminInvariant(tx, {
         targetUserId: params.targetUserId,
+        institutionId: params.institutionId,
         newRole: params.newRole,
         newStatus: params.newStatus,
-      },
-      ipAddress: params.ipAddress,
-    });
+      });
 
-    return { success: true };
+      const updated = await tx.institutionMembership.update({
+        where: {
+          userId_institutionId: {
+            userId: params.targetUserId,
+            institutionId: params.institutionId,
+          },
+        },
+        data: {
+          ...(params.newRole !== undefined
+            ? { role: params.newRole }
+            : {}),
+          ...(params.newStatus !== undefined
+            ? { status: params.newStatus }
+            : {}),
+        },
+      });
+
+      await auditLogRepository.createInTransaction(tx, {
+        userId: params.callerUserId,
+        institutionId: params.institutionId,
+        action: 'MEMBERSHIP_ROLE_UPDATED',
+        resource: 'InstitutionMembership',
+        details: {
+          targetUserId: params.targetUserId,
+          roleBefore: targetMem.role,
+          roleAfter: updated.role,
+          statusBefore: targetMem.status,
+          statusAfter: updated.status,
+        },
+        ipAddress: params.ipAddress,
+      });
+
+      return { success: true };
+    });
   }
 
   /**
    * Cleanup expired sessions task
    */
   async cleanupExpiredSessions(): Promise<number> {
-    if (this.isDbConfigured) {
-      return await sessionRepository.cleanupExpiredSessions();
-    } else {
-      let count = 0;
-      const now = new Date();
-      for (const [hash, s] of this.memSessions.entries()) {
-        if (s.expiresAt < now || s.revokedAt) {
-          this.memSessions.delete(hash);
-          count++;
-        }
-      }
-      return count;
+    if (!this.isDbConfigured) {
+      throw new Error('DATABASE_URL wajib tersedia untuk cleanup sesi.');
     }
+
+    return sessionRepository.cleanupExpiredSessions();
   }
 }
 

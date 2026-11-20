@@ -97,3 +97,17 @@ class RateLimiter {
 
 export const authRateLimiter = new RateLimiter(5, 15 * 60 * 1000, 15 * 60 * 1000);
 export const registerRateLimiter = new RateLimiter(10, 60 * 60 * 1000, 30 * 60 * 1000);
+
+// Password-reset endpoints count every request, not only failed credentials.
+// These in-memory limits are per Node.js process and should be replaced by a
+// shared store (e.g. Redis) before running multiple application instances.
+export const passwordResetRequestRateLimiter = new RateLimiter(
+  5,
+  60 * 60 * 1000,
+  60 * 60 * 1000
+);
+export const passwordResetAttemptRateLimiter = new RateLimiter(
+  10,
+  15 * 60 * 1000,
+  15 * 60 * 1000
+);

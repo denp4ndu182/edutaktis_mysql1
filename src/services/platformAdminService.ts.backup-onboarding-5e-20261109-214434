@@ -1,0 +1,406 @@
+import { prisma } from '../db/prisma';
+import { InstitutionRole, MembershipStatus, Prisma } from '@prisma/client';
+import { auditLogRepository } from '../repositories/auditLogRepository';
+import {
+  withSuperAdminGuard,
+  assertSuperAdminInvariant,
+} from '../security/superAdminGuard';
+
+type InstitutionUpdateData = {
+  namaResmi?: string;
+  namaSingkat?: string;
+  jenjang?: string;
+  alamatLengkap?: string;
+  namaKepala?: string | null;
+  nipKepala?: string | null;
+  kotaTandaTangan?: string | null;
+  telepon?: string | null;
+  email?: string | null;
+  website?: string | null;
+};
+
+export class PlatformAdminService {
+
+    async getPlatformStats() {
+    const [totalInstitutions, totalUsers, totalProjects, totalAuditLogs, pendingMemberships] = await Promise.all([
+      prisma.institution.count(),
+      prisma.user.count(),
+      prisma.project.count(),
+      prisma.auditLog.count(),
+      prisma.institutionMembership.count({ where: { status: MembershipStatus.PENDING } }),
+    ]);
+
+    const activeUsers = await prisma.user.count({ where: { isActive: true } });
+    const inactiveUsers = await prisma.user.count({ where: { isActive: false } });
+
+    return {
+      totalInstitutions,
+      activeInstitutions: totalInstitutions,
+      totalUsers,
+      activeUsers,
+      inactiveUsers,
+      pendingMemberships,
+      totalProjects,
+      totalAuditLogs,
+    };
+  }
+
+  async listInstitutions(params: { limit?: number; offset?: number; search?: string }) {
+    const limit = Math.min(Math.max(params.limit || 25, 1), 100);
+    const offset = Math.max(params.offset || 0, 0);
+    const search = params.search?.trim() || '';
+
+    const where: Prisma.InstitutionWhereInput = search
+      ? {
+          OR: [
+            { namaResmi: { contains: search } },
+            { namaSingkat: { contains: search } },
+            { npsn: { contains: search } },
+            { kabupatenKota: { contains: search } },
+          ],
+        }
+      : {};
+
+    const [institutions, total] = await Promise.all([
+      prisma.institution.findMany({
+        where,
+        select: {
+          id: true,
+          npsn: true,
+          namaResmi: true,
+          jenjang: true,
+          kabupatenKota: true,
+          provinsi: true,
+          _count: { select: { memberships: true, projects: true } },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: limit,
+        skip: offset,
+      }),
+      prisma.institution.count({ where }),
+    ]);
+
+    return { institutions, total, limit, offset };
+  }
+
+  async createInstitution(data: {
+    npsn: string;
+    namaResmi: string;
+    namaSingkat?: string;
+    jenjang: string;
+    jenisInstitusi?: string;
+    kementerianDinas?: string;
+    alamatLengkap?: string;
+    kabupatenKota: string;
+    provinsi: string;
+    namaKepala?: string;
+    nipKepala?: string;
+    kotaTandaTangan?: string;
+    actorUserId: string;
+    ipAddress?: string;
+  }) {
+    const existing = await prisma.institution.findUnique({ where: { npsn: data.npsn.trim() } });
+    if (existing) {
+      throw new Error('NPSN sudah terdaftar dalam sistem.');
+    }
+
+    const created = await prisma.institution.create({
+      data: {
+        npsn: data.npsn.trim(),
+        namaResmi: data.namaResmi.trim(),
+        namaSingkat: data.namaSingkat?.trim() || data.namaResmi.trim(),
+        jenjang: data.jenjang.trim(),
+        jenisInstitusi: data.jenisInstitusi?.trim() || 'Negeri',
+        kementerianDinas: data.kementerianDinas?.trim() || 'Kementerian Agama',
+        alamatLengkap: data.alamatLengkap?.trim() || '-',
+        kabupatenKota: data.kabupatenKota.trim(),
+        provinsi: data.provinsi.trim(),
+        namaKepala: data.namaKepala?.trim() || null,
+        nipKepala: data.nipKepala?.trim() || null,
+        kotaTandaTangan: data.kotaTandaTangan?.trim() || data.kabupatenKota,
+      },
+    });
+
+    await auditLogRepository.logAction({
+      userId: data.actorUserId,
+      institutionId: created.id,
+      action: 'PLATFORM_INSTITUTION_CREATED',
+      resource: 'Institution',
+      details: { npsn: created.npsn, namaResmi: created.namaResmi },
+      ipAddress: data.ipAddress,
+    });
+
+    return created;
+  }
+
+  async updateInstitution(
+    id: string,
+    data: InstitutionUpdateData,
+    actorUserId: string,
+    ipAddress?: string
+  ) {
+    const institution = await prisma.institution.findUnique({ where: { id } });
+    if (!institution) {
+      throw new Error('Institusi tidak ditemukan.');
+    }
+
+    // Defense in depth: only explicitly approved scalar fields reach Prisma.
+    const safeData: InstitutionUpdateData = {
+      ...(data.namaResmi !== undefined ? { namaResmi: data.namaResmi } : {}),
+      ...(data.namaSingkat !== undefined ? { namaSingkat: data.namaSingkat } : {}),
+      ...(data.jenjang !== undefined ? { jenjang: data.jenjang } : {}),
+      ...(data.alamatLengkap !== undefined ? { alamatLengkap: data.alamatLengkap } : {}),
+      ...(data.namaKepala !== undefined ? { namaKepala: data.namaKepala } : {}),
+      ...(data.nipKepala !== undefined ? { nipKepala: data.nipKepala } : {}),
+      ...(data.kotaTandaTangan !== undefined ? { kotaTandaTangan: data.kotaTandaTangan } : {}),
+      ...(data.telepon !== undefined ? { telepon: data.telepon } : {}),
+      ...(data.email !== undefined ? { email: data.email } : {}),
+      ...(data.website !== undefined ? { website: data.website } : {}),
+    };
+
+    if (Object.keys(safeData).length === 0) {
+      throw new Error('Tidak ada data institusi yang dapat diperbarui.');
+    }
+
+    const updated = await prisma.institution.update({
+      where: { id },
+      data: safeData,
+    });
+
+    await auditLogRepository.logAction({
+      userId: actorUserId,
+      institutionId: id,
+      action: 'PLATFORM_INSTITUTION_UPDATED',
+      resource: 'Institution',
+      details: { changedFields: Object.keys(safeData) },
+      ipAddress,
+    });
+
+    return updated;
+  }
+
+  async listUsers(params: { limit?: number; offset?: number; search?: string }) {
+    const limit = Math.min(Math.max(params.limit || 25, 1), 100);
+    const offset = Math.max(params.offset || 0, 0);
+    const search = params.search?.trim() || '';
+
+    const where: Prisma.UserWhereInput = search
+      ? {
+          OR: [
+            { email: { contains: search } },
+            { namaLengkap: { contains: search } },
+            { nip: { contains: search } },
+          ],
+        }
+      : {};
+
+    const [users, total] = await Promise.all([
+      prisma.user.findMany({
+        where,
+        select: {
+          id: true,
+          email: true,
+          namaLengkap: true,
+          nip: true,
+          nuptk: true,
+          isActive: true,
+          _count: { select: { memberships: true } },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: limit,
+        skip: offset,
+      }),
+      prisma.user.count({ where }),
+    ]);
+
+    return { users, total, limit, offset };
+  }
+
+
+  async updateUserStatus(
+    userId: string,
+    isActive: boolean,
+    actorUserId: string,
+    ipAddress?: string
+  ) {
+    const result = await withSuperAdminGuard(async (tx) => {
+      const user = await tx.user.findUnique({
+        where: { id: userId },
+        select: {
+          id: true,
+          isActive: true,
+        },
+      });
+
+      if (!user) {
+        throw new Error('Pengguna tidak ditemukan.');
+      }
+
+      await assertSuperAdminInvariant(tx, {
+        targetUserId: userId,
+        newUserActiveStatus: isActive,
+      });
+
+      const updated = await tx.user.update({
+        where: { id: userId },
+        data: { isActive },
+        select: {
+          id: true,
+          email: true,
+          namaLengkap: true,
+          nip: true,
+          nuptk: true,
+          isActive: true,
+          _count: {
+            select: {
+              memberships: true,
+            },
+          },
+        },
+      });
+
+      return {
+        isActiveBefore: user.isActive,
+        updated,
+      };
+    });
+
+    await auditLogRepository.logAction({
+      userId: actorUserId,
+      action: 'PLATFORM_USER_STATUS_UPDATED',
+      resource: 'User',
+      details: {
+        targetUserId: userId,
+        isActiveBefore: result.isActiveBefore,
+        isActiveAfter: result.updated.isActive,
+      },
+      ipAddress,
+    });
+
+    return result.updated;
+  }
+
+
+  async listMemberships(params: { limit?: number; offset?: number; institutionId?: string; role?: InstitutionRole; status?: MembershipStatus }) {
+    const limit = Math.min(Math.max(params.limit || 25, 1), 100);
+    const offset = Math.max(params.offset || 0, 0);
+
+    const where: Prisma.InstitutionMembershipWhereInput = {
+      ...(params.institutionId ? { institutionId: params.institutionId } : {}),
+      ...(params.role ? { role: params.role } : {}),
+      ...(params.status ? { status: params.status } : {}),
+    };
+
+    const [memberships, total] = await Promise.all([
+      prisma.institutionMembership.findMany({
+        where,
+        select: {
+          id: true,
+          role: true,
+          status: true,
+          joinedAt: true,
+          user: {
+            select: {
+              id: true,
+              namaLengkap: true,
+              email: true,
+            },
+          },
+          institution: {
+            select: {
+              id: true,
+              namaResmi: true,
+              npsn: true,
+            },
+          },
+        },
+        orderBy: { joinedAt: 'desc' },
+        take: limit,
+        skip: offset,
+      }),
+      prisma.institutionMembership.count({ where }),
+    ]);
+
+    return { memberships, total, limit, offset };
+  }
+
+
+  async updateMembership(
+    userId: string,
+    institutionId: string,
+    newRole?: InstitutionRole,
+    newStatus?: MembershipStatus,
+    actorUserId?: string,
+    ipAddress?: string
+  ) {
+    if (newRole === InstitutionRole.SUPER_ADMIN) {
+      throw new Error(
+        'SECURITY_VIOLATION: Pemberian peran SUPER_ADMIN hanya diperbolehkan melalui prosedur khusus.'
+      );
+    }
+
+    if (newRole === undefined && newStatus === undefined) {
+      throw new Error('Tidak ada perubahan membership yang diminta.');
+    }
+
+    const result = await withSuperAdminGuard(async (tx) => {
+      const mem = await tx.institutionMembership.findUnique({
+        where: {
+          userId_institutionId: {
+            userId,
+            institutionId,
+          },
+        },
+      });
+
+      if (!mem) {
+        throw new Error('Keanggotaan institusi tidak ditemukan.');
+      }
+
+      await assertSuperAdminInvariant(tx, {
+        targetUserId: userId,
+        institutionId,
+        newRole,
+        newStatus,
+      });
+
+      const updated = await tx.institutionMembership.update({
+        where: {
+          userId_institutionId: {
+            userId,
+            institutionId,
+          },
+        },
+        data: {
+          ...(newRole !== undefined ? { role: newRole } : {}),
+          ...(newStatus !== undefined ? { status: newStatus } : {}),
+        },
+      });
+
+      return {
+        before: mem,
+        after: updated,
+      };
+    });
+
+    if (actorUserId) {
+      await auditLogRepository.logAction({
+        userId: actorUserId,
+        institutionId,
+        action: 'PLATFORM_MEMBERSHIP_UPDATED',
+        resource: 'InstitutionMembership',
+        details: {
+          targetUserId: userId,
+          roleBefore: result.before.role,
+          roleAfter: result.after.role,
+          statusBefore: result.before.status,
+          statusAfter: result.after.status,
+        },
+        ipAddress,
+      });
+    }
+
+    return result.after;
+  }
+}
+export const platformAdminService = new PlatformAdminService();

@@ -1,0 +1,551 @@
+import { randomUUID } from 'node:crypto';
+import type { PrismaClient } from '@prisma/client';
+import { hashPassword } from '../src/security/password';
+
+const FIXTURE_MARKER = 'EDUTAKTIS_B05_TENANT_FIXTURE_V1';
+
+async function assertB05TestDatabase(prisma: PrismaClient): Promise<void> {
+  if (process.env.NODE_ENV !== 'test') {
+    throw new Error('STOP B05: NODE_ENV harus bernilai test.');
+  }
+
+  const identity = await prisma.$queryRaw<
+    { db: string; port: bigint }[]
+  >`SELECT DATABASE() AS db, @@port AS port`;
+
+  if (
+    identity[0]?.db !== 'edutaktis_onboarding_test' ||
+    Number(identity[0]?.port) !== 3306
+  ) {
+    throw new Error(
+      'STOP B05: operasi fixture hanya diizinkan pada edutaktis_onboarding_test.'
+    );
+  }
+}
+
+const ROLES = [
+  'SCHOOL_ADMIN',
+  'HEADMASTER',
+  'TEACHER',
+  'OPERATOR',
+  'TEACHER',
+  'TEACHER',
+  'SCHOOL_ADMIN',
+  'TEACHER',
+  'SUPER_ADMIN',
+] as const;
+
+const STATUSES = [
+  'ACTIVE',
+  'ACTIVE',
+  'ACTIVE',
+  'ACTIVE',
+  'PENDING',
+  'INACTIVE',
+  'ACTIVE',
+  'ACTIVE',
+  'ACTIVE',
+] as const;
+
+export interface B05TenantFixture {
+  marker: string;
+  users: Array<{ id: string; email: string }>;
+  institutions: Array<{ id: string; npsn: string }>;
+  memberships: Array<{
+    userId: string;
+    institutionId: string;
+    role: string;
+    status: string;
+  }>;
+  projects: Array<{
+    id: string;
+    institutionId: string;
+    userId: string;
+  }>;
+}
+
+function validatePassword(password: string): void {
+  if (
+    typeof password !== 'string' ||
+    password.length < 12 ||
+    password.length > 128 ||
+    !/[A-Z]/.test(password) ||
+    !/[a-z]/.test(password) ||
+    !/[0-9]/.test(password)
+  ) {
+    throw new Error(
+      'B05_TEST_PASSWORD harus 12–128 karakter dan mengandung huruf besar, huruf kecil, serta angka.'
+    );
+  }
+}
+
+export async function createB05TenantFixture(
+  prisma: PrismaClient,
+  password: string
+): Promise<B05TenantFixture> {
+  await assertB05TestDatabase(prisma);
+  validatePassword(password);
+
+  const unique = randomUUID();
+  const institutionAId = randomUUID();
+  const institutionBId = randomUUID();
+
+  const institutions = [
+    {
+      id: institutionAId,
+      npsn: `B05A${unique.replace(/-/g, '').slice(0, 15)}`,
+    },
+    {
+      id: institutionBId,
+      npsn: `B05B${unique.replace(/-/g, '').slice(0, 15)}`,
+    },
+  ];
+
+  const userDefinitions = [
+    { key: 'a-school-admin', role: 'SCHOOL_ADMIN', status: 'ACTIVE', tenant: 'A' },
+    { key: 'a-headmaster', role: 'HEADMASTER', status: 'ACTIVE', tenant: 'A' },
+    { key: 'a-teacher', role: 'TEACHER', status: 'ACTIVE', tenant: 'A' },
+    { key: 'a-operator', role: 'OPERATOR', status: 'ACTIVE', tenant: 'A' },
+    { key: 'a-pending', role: 'TEACHER', status: 'PENDING', tenant: 'A' },
+    { key: 'a-inactive', role: 'TEACHER', status: 'INACTIVE', tenant: 'A' },
+    { key: 'b-school-admin', role: 'SCHOOL_ADMIN', status: 'ACTIVE', tenant: 'B' },
+    { key: 'b-teacher', role: 'TEACHER', status: 'ACTIVE', tenant: 'B' },
+    { key: 'b-super-admin', role: 'SUPER_ADMIN', status: 'ACTIVE', tenant: 'B' },
+  ] as const;
+
+  const users = userDefinitions.map((definition) => ({
+    id: randomUUID(),
+    email: `b05-${definition.key}-${unique}@edutaktis.test`,
+  }));
+
+  const memberships = userDefinitions.map((definition, index) => ({
+    userId: users[index].id,
+    institutionId:
+      definition.tenant === 'A' ? institutionAId : institutionBId,
+    role: definition.role,
+    status: definition.status,
+  }));
+
+  const projectDefinitions = [
+    { ownerIndex: 2, tenant: 'A', name: 'B05 Tenant A Teacher Project' },
+    { ownerIndex: 1, tenant: 'A', name: 'B05 Tenant A Headmaster Project' },
+    { ownerIndex: 7, tenant: 'B', name: 'B05 Tenant B Teacher Project' },
+  ] as const;
+
+  const projects = projectDefinitions.map((definition, index) => ({
+    id: randomUUID(),
+    institutionId:
+      definition.tenant === 'A' ? institutionAId : institutionBId,
+    userId: users[definition.ownerIndex].id,
+  }));
+
+  const fixture: B05TenantFixture = {
+    marker: FIXTURE_MARKER,
+    users,
+    institutions,
+    memberships,
+    projects,
+  };
+
+  const passwordHash = await hashPassword(password);
+
+  try {
+    await prisma.$transaction(async (tx) => {
+      await tx.user.createMany({
+        data: users.map((user, index) => ({
+          id: user.id,
+          email: user.email,
+          passwordHash,
+          namaLengkap: `${FIXTURE_MARKER} ${userDefinitions[index].key}`,
+          isActive: true,
+          emailVerified: true,
+        })),
+      });
+
+      await tx.institution.createMany({
+        data: institutions.map((institution, index) => ({
+          id: institution.id,
+          npsn: institution.npsn,
+          namaResmi: `${FIXTURE_MARKER} Institution ${index === 0 ? 'A' : 'B'}`,
+          namaSingkat: `B05 Test ${index === 0 ? 'A' : 'B'}`,
+          jenjang: 'MA',
+          jenisInstitusi: 'NEGERI',
+          kementerianDinas: 'Kementerian Agama',
+          alamatLengkap: 'Alamat sintetis fixture B05',
+          kabupatenKota: 'Kota Pengujian',
+          provinsi: 'Provinsi Pengujian',
+        })),
+      });
+
+      await tx.institutionMembership.createMany({
+        data: memberships.map((membership, index) => ({
+          ...membership,
+          role: ROLES[index],
+          status: STATUSES[index],
+        })),
+      });
+
+      for (let index = 0; index < projectDefinitions.length; index++) {
+        const definition = projectDefinitions[index];
+        const project = projects[index];
+
+        await tx.project.create({
+          data: {
+            id: project.id,
+            institutionId: project.institutionId,
+            userId: project.userId,
+            name: `${FIXTURE_MARKER} ${definition.name}`,
+            masterInput: {
+              fixtureMarker: FIXTURE_MARKER,
+              subject: 'Pengujian Isolasi Tenant',
+            },
+            documents: {
+              fixtureMarker: FIXTURE_MARKER,
+              ACP: { status: 'completed', content: { fixture: true } },
+              TP: {
+                status: 'completed',
+                content: { listTP: [{ kodeTP: 'B05-TP-001' }] },
+              },
+              ATP: { status: 'completed', content: { fixture: true } },
+              collections: {
+                modulAjar: [
+                  {
+                    id: `b05-modul-${index + 1}`,
+                    title: `B05 Modul Ajar ${index + 1}`,
+                    version: 1,
+                    status: 'draft',
+                    content: { fixtureMarker: FIXTURE_MARKER },
+                    teacherInput: {},
+                    changelog: 'Fixture B05',
+                    versionsHistory: [],
+                  },
+                ],
+                lkpd: [
+                  {
+                    id: `b05-lkpd-${index + 1}`,
+                    title: `B05 LKPD ${index + 1}`,
+                    version: 1,
+                    status: 'draft',
+                    mode: 'FROM_ACADEMIC_DATA',
+                    createdAt: new Date().toISOString(),
+                    updatedAt: new Date().toISOString(),
+                    teacherInput: { materiPokok: 'Materi uji B05' },
+                    sourceReferences: {},
+                    content: null,
+                    changelog: 'Fixture B05',
+                    versionsHistory: [],
+                  },
+                ],
+              },
+            },
+          },
+        });
+      }
+    });
+
+    return fixture;
+  } catch (error) {
+    throw new Error(
+      `Pembuatan fixture B05 gagal. Periksa transaksi dan database test sebelum mencoba ulang. Detail: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+  }
+}
+
+export async function cleanupB05TenantFixture(
+  prisma: PrismaClient,
+  fixture: B05TenantFixture
+): Promise<void> {
+  await assertB05TestDatabase(prisma);
+
+  if (
+    fixture.marker !== FIXTURE_MARKER ||
+    fixture.users.length !== 9 ||
+    fixture.institutions.length !== 2 ||
+    fixture.memberships.length !== 9 ||
+    fixture.projects.length !== 3
+  ) {
+    throw new Error('Cleanup B05 ditolak: struktur atau marker fixture tidak cocok.');
+  }
+
+  const userIds = fixture.users.map((item) => item.id);
+  const emails = fixture.users.map((item) => item.email);
+  const institutionIds = fixture.institutions.map((item) => item.id);
+  const npsns = fixture.institutions.map((item) => item.npsn);
+  const projectIds = fixture.projects.map((item) => item.id);
+
+  const hasDuplicates = (values: string[]) =>
+    new Set(values).size !== values.length;
+
+  if (
+    hasDuplicates(userIds) ||
+    hasDuplicates(emails) ||
+    hasDuplicates(institutionIds) ||
+    hasDuplicates(npsns) ||
+    hasDuplicates(projectIds)
+  ) {
+    throw new Error('Cleanup B05 ditolak: ditemukan ID atau identitas fixture duplikat.');
+  }
+
+  await prisma.$transaction(async (tx) => {
+    const [users, institutions, memberships, projects, requests] =
+      await Promise.all([
+        tx.user.findMany({
+          where: { OR: [{ id: { in: userIds } }, { email: { in: emails } }] },
+          select: { id: true, email: true, namaLengkap: true },
+        }),
+        tx.institution.findMany({
+          where: { OR: [{ id: { in: institutionIds } }, { npsn: { in: npsns } }] },
+          select: { id: true, npsn: true, namaResmi: true },
+        }),
+        tx.institutionMembership.findMany({
+          where: {
+            OR: [
+              { userId: { in: userIds } },
+              { institutionId: { in: institutionIds } },
+            ],
+          },
+          select: {
+            userId: true,
+            institutionId: true,
+            role: true,
+            status: true,
+          },
+        }),
+        tx.project.findMany({
+          where: {
+            OR: [
+              { id: { in: projectIds } },
+              { userId: { in: userIds } },
+              { institutionId: { in: institutionIds } },
+            ],
+          },
+          select: {
+            id: true,
+            userId: true,
+            institutionId: true,
+            name: true,
+            masterInput: true,
+            documents: true,
+          },
+        }),
+        tx.institutionRequest.count({
+          where: {
+            OR: [
+              { requesterUserId: { in: userIds } },
+              { reviewedBy: { in: userIds } },
+              { institutionId: { in: institutionIds } },
+            ],
+          },
+        }),
+      ]);
+
+    if (
+      users.length !== fixture.users.length ||
+      institutions.length !== fixture.institutions.length ||
+      memberships.length !== fixture.memberships.length ||
+      projects.length !== fixture.projects.length ||
+      requests !== 0
+    ) {
+      throw new Error(
+        'Cleanup B05 dihentikan: jumlah relasi tidak sesuai fixture atau ditemukan InstitutionRequest terkait.'
+      );
+    }
+
+    const expectedMembershipKeys = fixture.memberships.map(
+      (item) => `${item.userId}::${item.institutionId}`
+    );
+
+    const actualMembershipKeys = memberships.map(
+      (item) => `${item.userId}::${item.institutionId}`
+    );
+
+    if (
+      new Set(expectedMembershipKeys).size !== expectedMembershipKeys.length ||
+      new Set(actualMembershipKeys).size !== actualMembershipKeys.length
+    ) {
+      throw new Error(
+        'Cleanup B05 dihentikan: ditemukan pasangan membership duplikat.'
+      );
+    }
+
+    const expectedMembershipMap = new Map(
+      fixture.memberships.map((item) => [
+        `${item.userId}::${item.institutionId}`,
+        `${item.role}::${item.status}`,
+      ])
+    );
+
+    const actualMembershipMap = new Map(
+      memberships.map((item) => [
+        `${item.userId}::${item.institutionId}`,
+        `${item.role}::${item.status}`,
+      ])
+    );
+
+    if (
+      expectedMembershipMap.size !== actualMembershipMap.size ||
+      [...expectedMembershipMap].some(
+        ([key, value]) => actualMembershipMap.get(key) !== value
+      )
+    ) {
+      throw new Error(
+        'Cleanup B05 dihentikan: seluruh pasangan user-institusi, role, dan status harus cocok persis.'
+      );
+    }
+
+    for (const project of fixture.projects) {
+      const ownerMembership = fixture.memberships.find(
+        (membership) =>
+          membership.userId === project.userId &&
+          membership.institutionId === project.institutionId
+      );
+
+      if (!ownerMembership || ownerMembership.status !== 'ACTIVE') {
+        throw new Error(
+          'Cleanup B05 dihentikan: pemilik project tidak memiliki membership ACTIVE pada institusi terkait.'
+        );
+      }
+    }
+
+    for (const expected of fixture.users) {
+      const actual = users.find((item) => item.id === expected.id);
+      if (
+        !actual ||
+        actual.email !== expected.email ||
+        !actual.namaLengkap.startsWith(`${FIXTURE_MARKER} `)
+      ) {
+        throw new Error('Cleanup B05 dihentikan: identitas user tidak cocok.');
+      }
+    }
+
+    for (const expected of fixture.institutions) {
+      const actual = institutions.find((item) => item.id === expected.id);
+      if (
+        !actual ||
+        actual.npsn !== expected.npsn ||
+        !actual.namaResmi.startsWith(`${FIXTURE_MARKER} Institution `)
+      ) {
+        throw new Error('Cleanup B05 dihentikan: identitas institusi tidak cocok.');
+      }
+    }
+
+    for (const expected of fixture.projects) {
+      const actual = projects.find((item) => item.id === expected.id);
+      if (
+        !actual ||
+        actual.userId !== expected.userId ||
+        actual.institutionId !== expected.institutionId ||
+        !actual.name.startsWith(FIXTURE_MARKER) ||
+        (actual.masterInput as any)?.fixtureMarker !== FIXTURE_MARKER ||
+        (actual.documents as any)?.fixtureMarker !== FIXTURE_MARKER
+      ) {
+        throw new Error('Cleanup B05 dihentikan: identitas project tidak cocok.');
+      }
+    }
+
+    const auditLogs = await tx.auditLog.findMany({
+      where: {
+        OR: [
+          { userId: { in: userIds } },
+          { institutionId: { in: institutionIds } },
+        ],
+      },
+      select: { id: true, userId: true, institutionId: true },
+    });
+
+    if (
+      auditLogs.some(
+        (log) =>
+          log.userId === null ||
+          !userIds.includes(log.userId) ||
+          (log.institutionId !== null &&
+            !institutionIds.includes(log.institutionId))
+      )
+    ) {
+      throw new Error(
+        'Cleanup B05 dihentikan: audit log memiliki aktor atau institusi di luar batas fixture.'
+      );
+    }
+
+    const deletedAuditLogs = await tx.auditLog.deleteMany({
+      where: {
+        userId: { in: userIds },
+      },
+    });
+
+    if (deletedAuditLogs.count !== auditLogs.length) {
+      throw new Error('Cleanup B05 dihentikan: jumlah audit log terhapus tidak sesuai.');
+    }
+
+    const sessionCount = await tx.userSession.count({
+      where: { userId: { in: userIds } },
+    });
+
+    const deletedSessions = await tx.userSession.deleteMany({
+      where: { userId: { in: userIds } },
+    });
+
+    if (deletedSessions.count !== sessionCount) {
+      throw new Error('Cleanup B05 dihentikan: jumlah session terhapus tidak sesuai.');
+    }
+
+    const resetTokenCount = await tx.passwordResetToken.count({
+      where: { userId: { in: userIds } },
+    });
+
+    const deletedResetTokens = await tx.passwordResetToken.deleteMany({
+      where: { userId: { in: userIds } },
+    });
+
+    if (deletedResetTokens.count !== resetTokenCount) {
+      throw new Error('Cleanup B05 dihentikan: jumlah reset token terhapus tidak sesuai.');
+    }
+    const deletedProjects = await tx.project.deleteMany({
+      where: { id: { in: projectIds } },
+    });
+
+    if (deletedProjects.count !== fixture.projects.length) {
+      throw new Error('Cleanup B05 dihentikan: jumlah project terhapus tidak sesuai.');
+    }
+
+    const deletedMemberships = await tx.institutionMembership.deleteMany({
+      where: {
+        userId: { in: userIds },
+        institutionId: { in: institutionIds },
+      },
+    });
+
+    if (deletedMemberships.count !== fixture.memberships.length) {
+      throw new Error('Cleanup B05 dihentikan: jumlah membership terhapus tidak sesuai.');
+    }
+
+    const deletedUsers = await tx.user.deleteMany({
+      where: { id: { in: userIds } },
+    });
+
+    if (deletedUsers.count !== fixture.users.length) {
+      throw new Error('Cleanup B05 dihentikan: jumlah user terhapus tidak sesuai.');
+    }
+
+    const deletedInstitutions = await tx.institution.deleteMany({
+      where: { id: { in: institutionIds } },
+    });
+
+    if (deletedInstitutions.count !== fixture.institutions.length) {
+      throw new Error('Cleanup B05 dihentikan: jumlah institusi terhapus tidak sesuai.');
+    }
+
+    const [remainingUsers, remainingInstitutions, remainingProjects] =
+      await Promise.all([
+        tx.user.count({ where: { id: { in: userIds } } }),
+        tx.institution.count({ where: { id: { in: institutionIds } } }),
+        tx.project.count({ where: { id: { in: projectIds } } }),
+      ]);
+
+    if (remainingUsers || remainingInstitutions || remainingProjects) {
+      throw new Error('Cleanup B05 gagal memverifikasi penghapusan fixture.');
+    }
+  });
+}

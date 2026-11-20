@@ -116,8 +116,8 @@ export interface InstitutionMembership {
 
 export interface TenantContext {
   currentUser: UserProfile;
-  currentMembership: InstitutionMembership;
-  currentInstitution: InstitutionProfile;
+  currentMembership: InstitutionMembership | null;
+  currentInstitution: InstitutionProfile | null;
   userInstitutions: Array<{
     institution: InstitutionProfile;
     membership: InstitutionMembership;

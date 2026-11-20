@@ -21,6 +21,19 @@ enum MembershipStatus {
   INACTIVE
 }
 
+
+enum InstitutionRequestStatus {
+  PENDING_REVIEW
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+enum GeneratorUsageScope {
+  IP
+  USER
+}
+
 model User {
   id                      String    @id @default(uuid()) @db.VarChar(36)
   email                   String    @unique @db.VarChar(255)
@@ -36,7 +49,7 @@ model User {
   isActive                Boolean   @default(true) @map("is_active")
   emailVerified           Boolean   @default(false) @map("email_verified")
   createdAt               DateTime  @default(now()) @map("created_at")
-  updatedAt               DateTime  @updatedAt @map("updated_at")
+  updatedAt               DateTime  @default(now()) @updatedAt @map("updated_at")
 
   // Relations
   memberships             InstitutionMembership[]
@@ -44,6 +57,9 @@ model User {
   auditLogs               AuditLog[]
   sessions                UserSession[]
   passwordResetTokens     PasswordResetToken[]
+  institutionRequestsSubmitted InstitutionRequest[] @relation("InstitutionRequestRequester")
+  institutionRequestsReviewed  InstitutionRequest[] @relation("InstitutionRequestReviewer")
+  generatorExecutionLock GeneratorExecutionLock?
 
   @@map("users")
 }
@@ -70,12 +86,13 @@ model Institution {
   nipKepala        String?   @map("nip_kepala") @db.VarChar(30)
   kotaTandaTangan  String?   @map("kota_tanda_tangan") @db.VarChar(100)
   createdAt        DateTime  @default(now()) @map("created_at")
-  updatedAt        DateTime  @updatedAt @map("updated_at")
+  updatedAt        DateTime  @default(now()) @updatedAt @map("updated_at")
 
   // Relations
   memberships      InstitutionMembership[]
   projects         Project[]
   auditLogs        AuditLog[]
+  institutionRequest InstitutionRequest?
 
   @@map("institutions")
 }
@@ -87,7 +104,7 @@ model InstitutionMembership {
   role          InstitutionRole  @default(TEACHER)
   status        MembershipStatus @default(ACTIVE)
   joinedAt      DateTime         @default(now()) @map("joined_at")
-  updatedAt     DateTime         @updatedAt @map("updated_at")
+  updatedAt     DateTime         @default(now()) @updatedAt @map("updated_at")
 
   // Relations
   user          User             @relation(fields: [userId], references: [id], onDelete: Restrict)
@@ -100,6 +117,45 @@ model InstitutionMembership {
   @@map("institution_memberships")
 }
 
+model InstitutionRequest {
+  id              String                    @id @default(uuid()) @db.VarChar(36)
+  requesterUserId String                    @map("requester_user_id") @db.VarChar(36)
+
+  npsn             String                   @db.VarChar(20)
+  namaResmi        String                   @map("nama_resmi") @db.VarChar(255)
+  namaSingkat      String                   @map("nama_singkat") @db.VarChar(100)
+  jenjang          String                   @db.VarChar(20)
+  jenisInstitusi   String                   @map("jenis_institusi") @db.VarChar(20)
+  kementerianDinas String                   @map("kementerian_dinas") @db.VarChar(255)
+  alamatLengkap    String                   @map("alamat_lengkap") @db.Text
+  kelurahanDesa    String?                  @map("kelurahan_desa") @db.VarChar(100)
+  kecamatan        String?                  @db.VarChar(100)
+  kabupatenKota    String                   @map("kabupaten_kota") @db.VarChar(100)
+  provinsi         String                   @db.VarChar(100)
+  kodePos          String?                  @map("kode_pos") @db.VarChar(20)
+  telepon          String?                  @db.VarChar(50)
+  email            String?                  @db.VarChar(255)
+  website          String?                  @db.VarChar(255)
+
+  status           InstitutionRequestStatus @default(PENDING_REVIEW)
+  institutionId    String?                  @unique @map("institution_id") @db.VarChar(36)
+  reviewedBy       String?                  @map("reviewed_by") @db.VarChar(36)
+  reviewedAt       DateTime?                @map("reviewed_at")
+  rejectionReason  String?                  @map("rejection_reason") @db.Text
+
+  createdAt        DateTime                 @default(now()) @map("created_at")
+  updatedAt        DateTime                 @default(now()) @updatedAt @map("updated_at")
+
+  requester        User                     @relation("InstitutionRequestRequester", fields: [requesterUserId], references: [id], onDelete: Restrict)
+  reviewer         User?                    @relation("InstitutionRequestReviewer", fields: [reviewedBy], references: [id], onDelete: SetNull)
+  institution      Institution?             @relation(fields: [institutionId], references: [id], onDelete: Restrict)
+
+  @@index([requesterUserId, status])
+  @@index([npsn, status])
+  @@index([status, createdAt])
+  @@map("institution_requests")
+}
+
 model Project {
   id            String       @id @default(uuid()) @db.VarChar(36)
   institutionId String       @map("institution_id") @db.VarChar(36)
@@ -108,7 +164,7 @@ model Project {
   masterInput   Json         @map("master_input")
   documents     Json?        @map("documents")
   createdAt     DateTime     @default(now()) @map("created_at")
-  updatedAt     DateTime     @updatedAt @map("updated_at")
+  updatedAt     DateTime     @default(now()) @updatedAt @map("updated_at")
 
   // Relations
   institution   Institution           @relation(fields: [institutionId], references: [id], onDelete: Restrict)
@@ -177,4 +233,36 @@ model PasswordResetToken {
   @@index([tokenHash])
   @@index([expiresAt])
   @@map("password_reset_tokens")
+}
+
+
+model GeneratorUsageCounter {
+  id            String              @id @default(uuid()) @db.VarChar(36)
+  scope         GeneratorUsageScope
+  keyHash       String              @map("key_hash") @db.Char(64)
+  windowSeconds Int                 @map("window_seconds") @db.UnsignedInt
+  windowStart   DateTime            @map("window_start") @db.DateTime(3)
+  windowEnd     DateTime            @map("window_end") @db.DateTime(3)
+  usageCount    Int                 @default(0) @map("usage_count") @db.UnsignedInt
+  createdAt     DateTime            @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt     DateTime            @default(now()) @updatedAt @map("updated_at") @db.DateTime(3)
+
+  @@unique([scope, keyHash, windowSeconds, windowStart], map: "generator_usage_counters_window_key")
+  @@index([windowEnd], map: "generator_usage_counters_window_end_idx")
+  @@map("generator_usage_counters")
+}
+
+model GeneratorExecutionLock {
+  id         String   @id @default(uuid()) @db.VarChar(36)
+  userId     String   @unique(map: "generator_execution_locks_user_id_key") @map("user_id") @db.VarChar(36)
+  ownerToken String   @map("owner_token") @db.Char(64)
+  acquiredAt DateTime @map("acquired_at") @db.DateTime(3)
+  expiresAt  DateTime @map("expires_at") @db.DateTime(3)
+  createdAt  DateTime @default(now()) @map("created_at") @db.DateTime(3)
+  updatedAt  DateTime @default(now()) @updatedAt @map("updated_at") @db.DateTime(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([expiresAt], map: "generator_execution_locks_expires_at_idx")
+  @@map("generator_execution_locks")
 }

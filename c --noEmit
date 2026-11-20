@@ -1,0 +1,133 @@
+[1mdiff --git a/scripts/fixture-b05-tenant.ts.backup-b05-collection-validation b/scripts/fixture-b05-tenant.ts[m
+[1mindex e4c995a..3018a39 100644[m
+[1m--- a/scripts/fixture-b05-tenant.ts.backup-b05-collection-validation[m
+[1m+++ b/scripts/fixture-b05-tenant.ts[m
+[36m@@ -279,6 +279,103 @@[m [mexport async function createB05TenantFixture([m
+   }[m
+ }[m
+ [m
+[32m+[m
+[32m+[m[32mfunction isPlainObject(value: unknown): value is Record<string, any> {[m
+[32m+[m[32m  return ([m
+[32m+[m[32m    value !== null &&[m
+[32m+[m[32m    typeof value === 'object' &&[m
+[32m+[m[32m    !Array.isArray(value)[m
+[32m+[m[32m  );[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction validateB05ProjectCollections([m
+[32m+[m[32m  documents: unknown,[m
+[32m+[m[32m  projectIndex: number[m
+[32m+[m[32m): boolean {[m
+[32m+[m[32m  if (!isPlainObject(documents)) return false;[m
+[32m+[m[32m  if (documents.fixtureMarker !== FIXTURE_MARKER) return false;[m
+[32m+[m
+[32m+[m[32m  const collections = documents.collections;[m
+[32m+[m[32m  if (!isPlainObject(collections)) return false;[m
+[32m+[m
+[32m+[m[32m  const modulAjar = collections.modulAjar;[m
+[32m+[m[32m  const lkpd = collections.lkpd;[m
+[32m+[m
+[32m+[m[32m  if (!Array.isArray(modulAjar) || modulAjar.length !== 1) {[m
+[32m+[m[32m    return false;[m
+[32m+[m[32m  }[m
+[32m+[m
+[32m+[m[32m  if (!Array.isArray(lkpd) || lkpd.length !== 1) {[m
+[32m+[m[32m    return false;[m
+[32m+[m[32m  }[m
+[32m+[m
+[32m+[m[32m  const expectedNumber = projectIndex + 1;[m
+[32m+[m[32m  const modul = modulAjar[0];[m
+[32m+[m[32m  const worksheet = lkpd[0];[m
+[32m+[m
+[32m+[m[32m  if (!isPlainObject(modul) || !isPlainObject(worksheet)) {[m
+[32m+[m[32m    return false;[m
+[32m+[m[32m  }[m
+[32m+[m
+[32m+[m[32m  const validSourceReferences = (value: unknown): boolean => {[m
+[32m+[m[32m    if (!isPlainObject(value)) return false;[m
+[32m+[m
+[32m+[m[32m    return ([m
+[32m+[m[32m      value.acpAvailable === true &&[m
+[32m+[m[32m      value.tpAvailable === true &&[m
+[32m+[m[32m      value.atpAvailable === true &&[m
+[32m+[m[32m      Array.isArray(value.selectedTpCodes) &&[m
+[32m+[m[32m      value.selectedTpCodes.length === 0 &&[m
+[32m+[m[32m      Array.isArray(value.selectedAtpCodes) &&[m
+[32m+[m[32m      value.selectedAtpCodes.length === 0 &&[m
+[32m+[m[32m      Array.isArray(value.tpItems) &&[m
+[32m+[m[32m      value.tpItems.length === 0 &&[m
+[32m+[m[32m      value.acpSummary === 'Fixture B05' &&[m
+[32m+[m[32m      Array.isArray(value.warnings) &&[m
+[32m+[m[32m      value.warnings.length === 0[m
+[32m+[m[32m    );[m
+[32m+[m[32m  };[m
+[32m+[m
+[32m+[m[32m  const validTeacherInput = (value: unknown): boolean => {[m
+[32m+[m[32m    if (!isPlainObject(value)) return false;[m
+[32m+[m
+[32m+[m[32m    return value.materiPokok === 'Materi uji B05';[m
+[32m+[m[32m  };[m
+[32m+[m
+[32m+[m[32m  return ([m
+[32m+[m[32m    modul.id === `b05-modul-${expectedNumber}` &&[m
+[32m+[m[32m    modul.title === `B05 Modul Ajar ${expectedNumber}` &&[m
+[32m+[m[32m    modul.version === 1 &&[m
+[32m+[m[32m    modul.status === 'draft' &&[m
+[32m+[m[32m    modul.content === null &&[m
+[32m+[m[32m    isPlainObject(modul.teacherInput) &&[m
+[32m+[m[32m    modul.teacherInput.materiPokok === 'Materi uji B05' &&[m
+[32m+[m[32m    modul.teacherInput.gayaMengajar === 'Kontekstual' &&[m
+[32m+[m[32m    modul.teacherInput.alokasiWaktu === 4 &&[m
+[32m+[m[32m    modul.teacherInput.jumlahPertemuan === 1 &&[m
+[32m+[m[32m    validSourceReferences(modul.sourceReferences) &&[m
+[32m+[m[32m    typeof modul.createdAt === 'string' &&[m
+[32m+[m[32m    typeof modul.updatedAt === 'string' &&[m
+[32m+[m[32m    modul.changelog === 'Fixture B05' &&[m
+[32m+[m[32m    Array.isArray(modul.versionsHistory) &&[m
+[32m+[m[32m    modul.versionsHistory.length === 0 &&[m
+[32m+[m
+[32m+[m[32m    worksheet.id === `b05-lkpd-${expectedNumber}` &&[m
+[32m+[m[32m    worksheet.title === `B05 LKPD ${expectedNumber}` &&[m
+[32m+[m[32m    worksheet.version === 1 &&[m
+[32m+[m[32m    worksheet.status === 'draft' &&[m
+[32m+[m[32m    worksheet.mode === 'FROM_ACADEMIC_DATA' &&[m
+[32m+[m[32m    worksheet.content === null &&[m
+[32m+[m[32m    validTeacherInput(worksheet.teacherInput) &&[m
+[32m+[m[32m    validSourceReferences(worksheet.sourceReferences) &&[m
+[32m+[m[32m    typeof worksheet.createdAt === 'string' &&[m
+[32m+[m[32m    typeof worksheet.updatedAt === 'string' &&[m
+[32m+[m[32m    worksheet.changelog === 'Fixture B05' &&[m
+[32m+[m[32m    Array.isArray(worksheet.versionsHistory) &&[m
+[32m+[m[32m    worksheet.versionsHistory.length === 0[m
+[32m+[m[32m  );[m
+[32m+[m[32m}[m
+[32m+[m
+ export async function cleanupB05TenantFixture([m
+   prisma: PrismaClient,[m
+   fixture: B05TenantFixture[m
+[36m@@ -457,17 +554,21 @@[m [mexport async function cleanupB05TenantFixture([m
+       }[m
+     }[m
+ [m
+[31m-    for (const expected of fixture.projects) {[m
+[32m+[m[32m    for (let index = 0; index < fixture.projects.length; index++) {[m
+[32m+[m[32m      const expected = fixture.projects[index];[m
+       const actual = projects.find((item) => item.id === expected.id);[m
+[32m+[m
+       if ([m
+         !actual ||[m
+         actual.userId !== expected.userId ||[m
+         actual.institutionId !== expected.institutionId ||[m
+         !actual.name.startsWith(FIXTURE_MARKER) ||[m
+         (actual.masterInput as any)?.fixtureMarker !== FIXTURE_MARKER ||[m
+[31m-        (actual.documents as any)?.fixtureMarker !== FIXTURE_MARKER[m
+[32m+[m[32m        !validateB05ProjectCollections(actual.documents, index)[m
+       ) {[m
+[31m-        throw new Error('Cleanup B05 dihentikan: identitas project tidak cocok.');[m
+[32m+[m[32m        throw new Error([m
+[32m+[m[32m          `Cleanup B05 dihentikan: identitas project atau koleksi dokumen fixture ke-${index + 1} tidak cocok.`[m
+[32m+[m[32m        );[m
+       }[m
+     }[m
+ [m

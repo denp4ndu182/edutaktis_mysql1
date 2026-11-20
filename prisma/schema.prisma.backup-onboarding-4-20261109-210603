@@ -1,0 +1,180 @@
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum InstitutionRole {
+  SUPER_ADMIN
+  SCHOOL_ADMIN
+  HEADMASTER
+  TEACHER
+  OPERATOR
+}
+
+enum MembershipStatus {
+  ACTIVE
+  PENDING
+  INACTIVE
+}
+
+model User {
+  id                      String    @id @default(uuid()) @db.VarChar(36)
+  email                   String    @unique @db.VarChar(255)
+  passwordHash            String?   @map("password_hash") @db.VarChar(255)
+  namaLengkap             String    @map("nama_lengkap") @db.VarChar(255)
+  gelarDepan              String?   @map("gelar_depan") @db.VarChar(50)
+  gelarBelakang           String?   @map("gelar_belakang") @db.VarChar(50)
+  nip                     String?   @db.VarChar(30)
+  nuptk                   String?   @db.VarChar(30)
+  nomorTelepon            String?   @map("nomor_telepon") @db.VarChar(30)
+  fotoProfilUrl           String?   @map("foto_profil_url") @db.Text
+  preferensiMataPelajaran String?   @map("preferensi_mata_pelajaran") @db.VarChar(150)
+  isActive                Boolean   @default(true) @map("is_active")
+  emailVerified           Boolean   @default(false) @map("email_verified")
+  createdAt               DateTime  @default(now()) @map("created_at")
+  updatedAt               DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  memberships             InstitutionMembership[]
+  projects                Project[]
+  auditLogs               AuditLog[]
+  sessions                UserSession[]
+  passwordResetTokens     PasswordResetToken[]
+
+  @@map("users")
+}
+
+model Institution {
+  id               String    @id @default(uuid()) @db.VarChar(36)
+  npsn             String    @unique @db.VarChar(20)
+  namaResmi        String    @map("nama_resmi") @db.VarChar(255)
+  namaSingkat      String    @map("nama_singkat") @db.VarChar(100)
+  jenjang          String    @db.VarChar(20)
+  jenisInstitusi   String    @map("jenis_institusi") @db.VarChar(20)
+  kementerianDinas String    @map("kementerian_dinas") @db.VarChar(255)
+  alamatLengkap    String    @map("alamat_lengkap") @db.Text
+  kelurahanDesa    String?   @map("kelurahan_desa") @db.VarChar(100)
+  kecamatan        String?   @db.VarChar(100)
+  kabupatenKota    String    @map("kabupaten_kota") @db.VarChar(100)
+  provinsi         String    @db.VarChar(100)
+  kodePos          String?   @map("kode_pos") @db.VarChar(20)
+  telepon          String?   @db.VarChar(50)
+  email            String?   @db.VarChar(255)
+  website          String?   @db.VarChar(255)
+  logoUrl          String?   @map("logo_url") @db.Text
+  namaKepala       String?   @map("nama_kepala") @db.VarChar(255)
+  nipKepala        String?   @map("nip_kepala") @db.VarChar(30)
+  kotaTandaTangan  String?   @map("kota_tanda_tangan") @db.VarChar(100)
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  memberships      InstitutionMembership[]
+  projects         Project[]
+  auditLogs        AuditLog[]
+
+  @@map("institutions")
+}
+
+model InstitutionMembership {
+  id            String           @id @default(uuid()) @db.VarChar(36)
+  userId        String           @map("user_id") @db.VarChar(36)
+  institutionId String           @map("institution_id") @db.VarChar(36)
+  role          InstitutionRole  @default(TEACHER)
+  status        MembershipStatus @default(ACTIVE)
+  joinedAt      DateTime         @default(now()) @map("joined_at")
+  updatedAt     DateTime         @updatedAt @map("updated_at")
+
+  // Relations
+  user          User             @relation(fields: [userId], references: [id], onDelete: Restrict)
+  institution   Institution      @relation(fields: [institutionId], references: [id], onDelete: Restrict)
+  projects      Project[]
+
+  @@unique([userId, institutionId])
+  @@index([institutionId])
+  @@index([userId])
+  @@map("institution_memberships")
+}
+
+model Project {
+  id            String       @id @default(uuid()) @db.VarChar(36)
+  institutionId String       @map("institution_id") @db.VarChar(36)
+  userId        String       @map("user_id") @db.VarChar(36)
+  name          String       @db.VarChar(255)
+  masterInput   Json         @map("master_input")
+  documents     Json?        @map("documents")
+  createdAt     DateTime     @default(now()) @map("created_at")
+  updatedAt     DateTime     @updatedAt @map("updated_at")
+
+  // Relations
+  institution   Institution           @relation(fields: [institutionId], references: [id], onDelete: Restrict)
+  user          User                  @relation(fields: [userId], references: [id], onDelete: Restrict)
+  membership    InstitutionMembership @relation(fields: [userId, institutionId], references: [userId, institutionId], onDelete: Restrict)
+
+  @@index([institutionId])
+  @@index([userId])
+  @@index([userId, institutionId])
+  @@index([createdAt])
+  @@map("projects")
+}
+
+model AuditLog {
+  id            String       @id @default(uuid()) @db.VarChar(36)
+  userId        String?      @map("user_id") @db.VarChar(36)
+  institutionId String?      @map("institution_id") @db.VarChar(36)
+  action        String       @db.VarChar(100)
+  resource      String       @db.VarChar(100)
+  details       Json?
+  ipAddress     String?      @map("ip_address") @db.VarChar(50)
+  createdAt     DateTime     @default(now()) @map("created_at")
+
+  // Relations
+  user          User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+  institution   Institution? @relation(fields: [institutionId], references: [id], onDelete: SetNull)
+
+  @@index([institutionId])
+  @@index([userId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+model UserSession {
+  id         String    @id @default(uuid()) @db.VarChar(36)
+  userId     String    @map("user_id") @db.VarChar(36)
+  tokenHash  String    @unique @map("token_hash") @db.VarChar(255)
+  expiresAt  DateTime  @map("expires_at")
+  revokedAt  DateTime? @map("revoked_at")
+  ipAddress  String?   @map("ip_address") @db.VarChar(50)
+  userAgent  String?   @map("user_agent") @db.Text
+  lastUsedAt DateTime  @default(now()) @map("last_used_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  // Relations
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([tokenHash])
+  @@index([expiresAt])
+  @@map("user_sessions")
+}
+
+model PasswordResetToken {
+  id        String    @id @default(uuid()) @db.VarChar(36)
+  userId    String    @map("user_id") @db.VarChar(36)
+  tokenHash String    @unique @map("token_hash") @db.VarChar(255)
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  // Relations
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([tokenHash])
+  @@index([expiresAt])
+  @@map("password_reset_tokens")
+}

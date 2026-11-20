@@ -31,10 +31,10 @@ export const InstitutionProfileView: React.FC<InstitutionProfileViewProps> = ({
   onSaveInstitutionProfile,
   onApplyToMasterInput,
 }) => {
-  const currentRole = tenantContext.currentMembership.role;
-  const isEditable = canEditInstitution(currentRole);
+  const currentRole = tenantContext.currentMembership?.role;
+  const isEditable = currentRole ? canEditInstitution(currentRole) : false;
 
-  const [institution, setInstitution] = useState<InstitutionProfile>(
+  const [institution, setInstitution] = useState<InstitutionProfile | null>(
     tenantContext.currentInstitution
   );
   const [savedToast, setSavedToast] = useState(false);
@@ -42,15 +42,15 @@ export const InstitutionProfileView: React.FC<InstitutionProfileViewProps> = ({
 
   const handleChange = (field: keyof InstitutionProfile, value: any) => {
     if (!isEditable) return;
-    setInstitution((prev) => ({
-      ...prev,
-      [field]: value,
-    }));
+    setInstitution((prev) => {
+      if (!prev) return prev;
+      return { ...prev, [field]: value };
+    });
   };
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!isEditable) return;
+    if (!isEditable || !institution || !currentRole) return;
 
     const result = onSaveInstitutionProfile(institution, currentRole);
     if (result.success) {
@@ -78,6 +78,29 @@ export const InstitutionProfileView: React.FC<InstitutionProfileViewProps> = ({
         return { label: role, color: 'bg-slate-100 text-slate-800 border-slate-200' };
     }
   };
+
+  if (!currentRole || !tenantContext.currentInstitution || !institution) {
+    return (
+      <div className="max-w-7xl mx-auto pb-16">
+        <div className="glass-surface rounded-3xl border border-white/60 p-8 shadow-md">
+          <div className="flex items-start gap-4">
+            <div className="w-14 h-14 rounded-2xl bg-amber-100 text-amber-700 flex items-center justify-center shrink-0">
+              <ShieldAlert className="w-7 h-7" />
+            </div>
+            <div>
+              <h2 className="text-lg font-black text-[#173B57]">
+                Profil Institusi Belum Tersedia
+              </h2>
+              <p className="text-sm text-[#64798B] mt-2 leading-relaxed">
+                Akun Anda belum terhubung dengan institusi. Profil madrasah
+                akan tersedia setelah administrator menetapkan keanggotaan Anda.
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   const roleBadge = getRoleBadge(currentRole);
 

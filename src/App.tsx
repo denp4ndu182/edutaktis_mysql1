@@ -28,6 +28,7 @@ import {
   getTenantContext,
   saveCurrentUser,
   saveInstitutionProfile,
+  setActiveInstitutionId,
   switchActiveInstitution,
   switchActiveUser,
   getAllUsers,
@@ -35,6 +36,7 @@ import {
 } from './services/tenantService';
 import {
   getCurrentSession,
+  switchInstitution as apiSwitchInstitution,
   logout as apiLogout,
   logoutAll as apiLogoutAll,
   AuthUser,
@@ -49,6 +51,7 @@ import { InstitutionProfileView } from './components/InstitutionProfileView';
 import { InstitutionMembershipView } from './components/InstitutionMembershipView';
 import { PlatformAdminConsole } from './components/PlatformAdminConsole';
 import { AuthModal } from './components/AuthModal';
+import { ResetPasswordView } from './components/ResetPasswordView';
 
 export default function App() {
   const [allProjects, setAllProjects] = useState<Project[]>(() => getAllProjects());
@@ -75,6 +78,15 @@ export default function App() {
           if (res.tenantContext) {
             setTenantContext(res.tenantContext as any);
           }
+        } else if (
+          res.code === 'TENANT_FORBIDDEN' &&
+          res.user &&
+          res.tenantContext
+        ) {
+          // The session is valid; only the requested tenant is unavailable.
+          setIsAuthenticated(true);
+          setTenantContext(res.tenantContext);
+          setActiveTab('membership');
         } else {
           setIsAuthenticated(false);
         }
@@ -130,9 +142,40 @@ export default function App() {
     return res;
   };
 
-  const handleSwitchActiveInstitution = (institutionId: string) => {
-    const updatedCtx = switchActiveInstitution(institutionId);
-    setTenantContext(updatedCtx);
+  const handleSwitchActiveInstitution = async (institutionId: string): Promise<void> => {
+    if (!isAuthenticated) {
+      // Demo/local mode retains its existing local switching behavior.
+      const updatedCtx = switchActiveInstitution(institutionId);
+      setTenantContext(updatedCtx);
+      return;
+    }
+
+    try {
+      // The backend must verify ACTIVE membership before the UI changes tenant.
+      const result = await apiSwitchInstitution(institutionId);
+
+      if (
+        !result?.success ||
+        result.activeInstitutionId !== institutionId ||
+        !result.currentMembership ||
+        !result.currentInstitution
+      ) {
+        alert(result?.error || 'Pergantian institusi ditolak oleh server.');
+        return;
+      }
+
+      // Persist the selected ID only after server verification succeeds.
+      setActiveInstitutionId(institutionId);
+
+      setTenantContext((previous) => ({
+        ...previous,
+        currentMembership: result.currentMembership,
+        currentInstitution: result.currentInstitution,
+      }));
+    } catch (error) {
+      console.error('Switch institution failed:', error);
+      alert('Gagal menghubungi server. Institusi aktif tidak diubah.');
+    }
   };
 
   const handleSwitchActiveUser = (userId: string) => {
@@ -243,7 +286,9 @@ export default function App() {
       tenantContext.currentInstitution
     );
     const institutionName =
-      tenantContext.currentInstitution.namaSingkat || tenantContext.currentInstitution.namaResmi;
+      tenantContext.currentInstitution?.namaSingkat ||
+      tenantContext.currentInstitution?.namaResmi ||
+      'Institusi Belum Terhubung';
     const subjectName = tenantContext.currentUser.preferensiMataPelajaran || 'Mapel';
     proj.name = `Administrasi ${subjectName} - ${institutionName}`;
     proj.masterInput = syncedMaster;
@@ -292,16 +337,30 @@ export default function App() {
     try {
       const res = await getCurrentSession();
       if (res.success && res.tenantContext) {
-        setTenantContext(res.tenantContext as any);
+        setTenantContext(res.tenantContext);
+      } else if (
+        res.code === 'TENANT_FORBIDDEN' &&
+        res.user &&
+        res.tenantContext
+      ) {
+        // Keep the authenticated session and let the user choose a valid tenant.
+        setTenantContext(res.tenantContext);
+        setActiveTab('membership');
       }
     } catch {
-      // fallback
+      // Preserve the existing login fallback behavior.
     }
   };
 
   const handleLogout = async () => {
     if (confirm('Apakah Anda yakin ingin keluar dari akun?')) {
-      await apiLogout();
+      const result = await apiLogout();
+
+      if (!result.success) {
+        alert(result.message || 'Gagal logout. Silakan coba kembali.');
+        return;
+      }
+
       setIsAuthenticated(false);
     }
   };
@@ -309,10 +368,20 @@ export default function App() {
   const handleLogoutAll = async () => {
     if (confirm('Yakin ingin mencabut seluruh sesi di semua perangkat?')) {
       const res = await apiLogoutAll();
+
+      if (!res.success) {
+        alert(res.message || 'Gagal mencabut seluruh sesi. Silakan coba kembali.');
+        return;
+      }
+
       alert(res.message || 'Seluruh sesi berhasil dicabut.');
       setIsAuthenticated(false);
     }
   };
+
+  if (window.location.pathname === '/reset-password') {
+    return <ResetPasswordView />;
+  }
 
   return (
     <Navbar

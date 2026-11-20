@@ -1,0 +1,179 @@
+import { prisma } from '../db/prisma';
+import { Prisma, InstitutionMembership, InstitutionRole, MembershipStatus } from '@prisma/client';
+
+export class MembershipRepository {
+  async findByUserAndInstitution(
+    userId: string,
+    institutionId: string,
+    tx: Prisma.TransactionClient = prisma
+  ): Promise<InstitutionMembership | null> {
+    return tx.institutionMembership.findUnique({
+      where: {
+        userId_institutionId: {
+          userId,
+          institutionId,
+        },
+      },
+    });
+  }
+
+  async listByUser(userId: string): Promise<
+    (InstitutionMembership & {
+      institution: {
+        id: string;
+        namaResmi: string;
+        namaSingkat: string;
+        npsn: string;
+        jenjang: string;
+      };
+    })[]
+  > {
+    return prisma.institutionMembership.findMany({
+      where: {
+        userId,
+        status: MembershipStatus.ACTIVE,
+      },
+      include: {
+        institution: {
+          select: {
+            id: true,
+            namaResmi: true,
+            namaSingkat: true,
+            npsn: true,
+            jenjang: true,
+          },
+        },
+      },
+      orderBy: { joinedAt: 'asc' },
+    });
+  }
+
+  async listByInstitution(institutionId: string): Promise<
+    (InstitutionMembership & {
+      user: {
+        id: string;
+        namaLengkap: string;
+        email: string;
+        nip: string | null;
+      };
+    })[]
+  > {
+    return prisma.institutionMembership.findMany({
+      where: { institutionId },
+      include: {
+        user: {
+          select: {
+            id: true,
+            namaLengkap: true,
+            email: true,
+            nip: true,
+          },
+        },
+      },
+      orderBy: { joinedAt: 'asc' },
+    });
+  }
+
+  /**
+   * Mengambil permintaan membership yang masih menunggu persetujuan.
+   * Data dibatasi pada satu institusi dan hanya menampilkan profil aman.
+   */
+  async listPendingByInstitution(
+    institutionId: string,
+    take = 50,
+    skip = 0
+  ) {
+    return prisma.institutionMembership.findMany({
+      where: {
+        institutionId,
+        status: MembershipStatus.PENDING,
+      },
+      select: {
+        id: true,
+        userId: true,
+        institutionId: true,
+        role: true,
+        status: true,
+        joinedAt: true,
+        updatedAt: true,
+        user: {
+          select: {
+            id: true,
+            namaLengkap: true,
+            email: true,
+            nip: true,
+          },
+        },
+      },
+      orderBy: { joinedAt: 'asc' },
+      take,
+      skip,
+    });
+  }
+
+  async create(
+    data: Prisma.InstitutionMembershipCreateInput,
+    tx: Prisma.TransactionClient = prisma
+  ): Promise<InstitutionMembership> {
+    return tx.institutionMembership.create({
+      data,
+    });
+  }
+
+  async updateRole(
+    userId: string,
+    institutionId: string,
+    role: InstitutionRole
+  ): Promise<InstitutionMembership> {
+    return prisma.institutionMembership.update({
+      where: {
+        userId_institutionId: {
+          userId,
+          institutionId,
+        },
+      },
+      data: { role },
+    });
+  }
+
+  async updateStatus(
+    userId: string,
+    institutionId: string,
+    status: MembershipStatus
+  ): Promise<InstitutionMembership> {
+    return prisma.institutionMembership.update({
+      where: {
+        userId_institutionId: {
+          userId,
+          institutionId,
+        },
+      },
+      data: { status },
+    });
+  }
+
+  /**
+   * Transisi status hanya jika membership masih PENDING.
+   * Wajib dipanggil menggunakan transaksi dari service.
+   * count = 1 berarti berhasil; count = 0 berarti sudah berubah/tidak ditemukan.
+   */
+  async transitionPendingStatus(
+    userId: string,
+    institutionId: string,
+    status: Extract<MembershipStatus, 'ACTIVE' | 'INACTIVE'>,
+    tx: Prisma.TransactionClient
+  ): Promise<number> {
+    const result = await tx.institutionMembership.updateMany({
+      where: {
+        userId,
+        institutionId,
+        status: MembershipStatus.PENDING,
+      },
+      data: { status },
+    });
+
+    return result.count;
+  }
+}
+
+export const membershipRepository = new MembershipRepository();

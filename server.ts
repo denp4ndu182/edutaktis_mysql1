@@ -1,11 +1,12 @@
-import express, { Request, Response } from 'express';
-import dotenv from 'dotenv';
+import 'dotenv/config';
+import express, { NextFunction, Request, Response } from 'express';
 import path from 'path';
-import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI } from '@google/genai';
 import cookieParser from 'cookie-parser';
+import { InstitutionRole, MembershipStatus } from '@prisma/client';
 import { authService } from './src/security/authService';
+import { toSafeUserProfile } from './src/security/userDto';
 import {
   requireAuth,
   requireInstitutionMembership,
@@ -18,6 +19,8 @@ import {
   CSRF_COOKIE_NAME,
   SESSION_DURATION_MS,
   generateCsrfToken,
+  verifyCsrfToken,
+  validateSecurityConfiguration,
 } from './src/security/tokens';
 import {
   hasPermission,
@@ -31,14 +34,425 @@ import { auditLogRepository } from './src/repositories/auditLogRepository';
 import { legacyMigrationService } from './src/services/legacyMigrationService';
 import { academicMappingService } from './src/services/academicMappingService';
 import { modulAjarAiService } from './src/services/modulAjarAiService';
+import { institutionOnboardingService, type SubmitInstitutionRequestInput } from './src/services/institutionOnboardingService';
+import { membershipApprovalService } from './src/services/membershipApprovalService';
+import { validateGeneratorQuotaSecret,} from './src/security/generatorQuotaSecurity';
+import { randomUUID } from 'node:crypto';
+import { generatorQuotaService, GeneratorQuotaServiceError } from './src/services/generatorQuotaService';
+import { validateGeneratorRequest, type ValidatedGeneratorRequest } from './src/security/generatorRequestValidator';
+import { validateGeneratorOutput } from './src/security/generatorOutputValidator';
+import {
+  generateDeterministicACP,
+  generateDeterministicTP,
+  generateDeterministicATP,
+  generateDeterministicPROTA,
+  generateDeterministicPROSEM,
+  generateDeterministicKKTP,
+} from './src/shared/deterministicDocumentGenerators';
+import type {
+  AnyDocumentContent,
+  AcpData,
+  TpData,
+  AtpData,
+  ProtaData,
+} from './src/types';
 
-dotenv.config();
+
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+const ALLOWED_MEMBERSHIP_ROLES = [
+  InstitutionRole.SCHOOL_ADMIN,
+  InstitutionRole.HEADMASTER,
+  InstitutionRole.TEACHER,
+  InstitutionRole.OPERATOR,
+] as const;
+
+const ALLOWED_MEMBERSHIP_STATUSES = [
+  MembershipStatus.ACTIVE,
+  MembershipStatus.PENDING,
+  MembershipStatus.INACTIVE,
+] as const;
+
+function validateMembershipUpdateBody(
+  body: unknown,
+  userIdField: 'targetUserId' | 'userId'
+):
+  | {
+      valid: true;
+      data: {
+        userId: string;
+        institutionId: string;
+        newRole?: InstitutionRole;
+        newStatus?: MembershipStatus;
+      };
+    }
+  | { valid: false; error: string } {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return { valid: false, error: 'Format data tidak valid.' };
+  }
+
+  const data = body as Record<string, unknown>;
+  const allowedKeys = new Set([
+    userIdField,
+    'institutionId',
+    'newRole',
+    'newStatus',
+  ]);
+
+  if (Object.keys(data).some((key) => !allowedKeys.has(key))) {
+    return { valid: false, error: 'Terdapat field yang tidak diizinkan.' };
+  }
+
+  const userId = data[userIdField];
+  const institutionId = data.institutionId;
+
+  if (
+    typeof userId !== 'string' ||
+    userId.trim().length === 0 ||
+    userId.length > 36 ||
+    typeof institutionId !== 'string' ||
+    institutionId.trim().length === 0 ||
+    institutionId.length > 36
+  ) {
+    return { valid: false, error: 'ID pengguna atau institusi tidak valid.' };
+  }
+
+  if (data.newRole === undefined && data.newStatus === undefined) {
+    return {
+      valid: false,
+      error: 'Minimal satu perubahan role atau status wajib disertakan.',
+    };
+  }
+
+  if (
+    data.newRole !== undefined &&
+    (typeof data.newRole !== 'string' ||
+      !ALLOWED_MEMBERSHIP_ROLES.includes(
+        data.newRole as (typeof ALLOWED_MEMBERSHIP_ROLES)[number]
+      ))
+  ) {
+    return { valid: false, error: 'Role tidak diizinkan.' };
+  }
+
+  if (
+    data.newStatus !== undefined &&
+    (typeof data.newStatus !== 'string' ||
+      !ALLOWED_MEMBERSHIP_STATUSES.includes(
+        data.newStatus as (typeof ALLOWED_MEMBERSHIP_STATUSES)[number]
+      ))
+  ) {
+    return { valid: false, error: 'Status keanggotaan tidak valid.' };
+  }
+
+  return {
+    valid: true,
+    data: {
+      userId: userId.trim(),
+      institutionId: institutionId.trim(),
+      ...(data.newRole !== undefined
+        ? { newRole: data.newRole as InstitutionRole }
+        : {}),
+      ...(data.newStatus !== undefined
+        ? { newStatus: data.newStatus as MembershipStatus }
+        : {}),
+    },
+  };
+}
+
+
+
+type InstitutionRequestBodyData = Omit<
+  SubmitInstitutionRequestInput,
+  'requesterUserId' | 'ipAddress'
+>;
+
+type ValidationResult<T> =
+  | { valid: true; data: T }
+  | { valid: false; error: string };
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    !Array.isArray(value) &&
+    (Object.getPrototypeOf(value) === Object.prototype ||
+      Object.getPrototypeOf(value) === null)
+  );
+}
+
+function readRequiredText(
+  data: Record<string, unknown>,
+  field: string,
+  label: string,
+  maxLength: number
+): ValidationResult<string> {
+  const value = data[field];
+
+  if (typeof value !== 'string') {
+    return { valid: false, error: `${label} wajib berupa teks.` };
+  }
+
+  const normalized = value.trim();
+
+  if (!normalized) {
+    return { valid: false, error: `${label} wajib diisi.` };
+  }
+
+  if (normalized.length > maxLength) {
+    return {
+      valid: false,
+      error: `${label} maksimal ${maxLength} karakter.`,
+    };
+  }
+
+  return { valid: true, data: normalized };
+}
+
+function readOptionalText(
+  data: Record<string, unknown>,
+  field: string,
+  label: string,
+  maxLength: number
+): ValidationResult<string | null> {
+  const value = data[field];
+
+  if (value === undefined || value === null || value === '') {
+    return { valid: true, data: null };
+  }
+
+  if (typeof value !== 'string') {
+    return { valid: false, error: `${label} harus berupa teks.` };
+  }
+
+  const normalized = value.trim();
+
+  if (!normalized) {
+    return { valid: true, data: null };
+  }
+
+  if (normalized.length > maxLength) {
+    return {
+      valid: false,
+      error: `${label} maksimal ${maxLength} karakter.`,
+    };
+  }
+
+  return { valid: true, data: normalized };
+}
+
+function validateInstitutionRequestBody(
+  body: unknown
+): ValidationResult<InstitutionRequestBodyData> {
+  if (!isPlainObject(body)) {
+    return { valid: false, error: 'Format data pengajuan tidak valid.' };
+  }
+
+  const allowedKeys = new Set([
+    'npsn',
+    'namaResmi',
+    'namaSingkat',
+    'jenjang',
+    'jenisInstitusi',
+    'kementerianDinas',
+    'alamatLengkap',
+    'kelurahanDesa',
+    'kecamatan',
+    'kabupatenKota',
+    'provinsi',
+    'kodePos',
+    'telepon',
+    'email',
+    'website',
+  ]);
+
+  if (Object.keys(body).some((key) => !allowedKeys.has(key))) {
+    return {
+      valid: false,
+      error: 'Terdapat field pengajuan yang tidak diizinkan.',
+    };
+  }
+
+  const requiredFields = [
+    ['npsn', 'NPSN', 20],
+    ['namaResmi', 'Nama resmi', 255],
+    ['namaSingkat', 'Nama singkat', 100],
+    ['jenjang', 'Jenjang', 20],
+    ['jenisInstitusi', 'Jenis institusi', 20],
+    ['kementerianDinas', 'Kementerian/dinas', 255],
+    ['alamatLengkap', 'Alamat lengkap', 10000],
+    ['kabupatenKota', 'Kabupaten/kota', 100],
+    ['provinsi', 'Provinsi', 100],
+  ] as const;
+
+  const required: Record<string, string> = {};
+
+  for (const [field, label, maxLength] of requiredFields) {
+    const result = readRequiredText(body, field, label, maxLength);
+    if (!result.valid) return result;
+    required[field] = result.data;
+  }
+
+  const optionalFields = [
+    ['kelurahanDesa', 'Kelurahan/desa', 100],
+    ['kecamatan', 'Kecamatan', 100],
+    ['kodePos', 'Kode pos', 20],
+    ['telepon', 'Telepon', 50],
+    ['email', 'Email', 255],
+    ['website', 'Website', 255],
+  ] as const;
+
+  const optional: Record<string, string | null> = {};
+
+  for (const [field, label, maxLength] of optionalFields) {
+    const result = readOptionalText(body, field, label, maxLength);
+    if (!result.valid) return result;
+    optional[field] = result.data;
+  }
+
+  if (optional.email) {
+    const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailPattern.test(optional.email)) {
+      return { valid: false, error: 'Format email institusi tidak valid.' };
+    }
+  }
+
+  if (optional.website) {
+    try {
+      const websiteUrl = new URL(optional.website);
+      if (
+        !['http:', 'https:'].includes(websiteUrl.protocol) ||
+        !websiteUrl.hostname
+      ) {
+        throw new Error('invalid URL');
+      }
+    } catch {
+      return {
+        valid: false,
+        error: 'Website harus berupa URL HTTP atau HTTPS yang valid.',
+      };
+    }
+  }
+
+  return {
+    valid: true,
+    data: {
+      npsn: required.npsn,
+      namaResmi: required.namaResmi,
+      namaSingkat: required.namaSingkat,
+      jenjang: required.jenjang,
+      jenisInstitusi: required.jenisInstitusi,
+      kementerianDinas: required.kementerianDinas,
+      alamatLengkap: required.alamatLengkap,
+      kabupatenKota: required.kabupatenKota,
+      provinsi: required.provinsi,
+      kelurahanDesa: optional.kelurahanDesa,
+      kecamatan: optional.kecamatan,
+      kodePos: optional.kodePos,
+      telepon: optional.telepon,
+      email: optional.email,
+      website: optional.website,
+    },
+  };
+}
+
+function validateInstitutionRequestId(
+  value: unknown
+): ValidationResult<string> {
+  if (typeof value !== 'string') {
+    return { valid: false, error: 'ID pengajuan tidak valid.' };
+  }
+
+  const normalized = value.trim();
+
+  const uuidPattern =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  if (!uuidPattern.test(normalized)) {
+    return { valid: false, error: 'ID pengajuan harus menggunakan format UUID yang valid.' };
+  }
+
+  return { valid: true, data: normalized };
+}
+
+function validateInstitutionRequestRejectionBody(
+  body: unknown
+): ValidationResult<{ rejectionReason: string }> {
+  if (!isPlainObject(body)) {
+    return { valid: false, error: 'Format alasan penolakan tidak valid.' };
+  }
+
+  if (
+    Object.keys(body).some((key) => key !== 'rejectionReason')
+  ) {
+    return {
+      valid: false,
+      error: 'Terdapat field penolakan yang tidak diizinkan.',
+    };
+  }
+
+  const result = readRequiredText(
+    body,
+    'rejectionReason',
+    'Alasan penolakan',
+    5000
+  );
+
+  if (!result.valid) return result;
+
+  return {
+    valid: true,
+    data: { rejectionReason: result.data },
+  };
+}
+
+function validatePaginationQuery(
+  query: Record<string, unknown>
+): ValidationResult<{ take: number; skip: number }> {
+  const allowedKeys = new Set(['take', 'skip']);
+
+  if (Object.keys(query).some((key) => !allowedKeys.has(key))) {
+    return {
+      valid: false,
+      error: 'Parameter pagination tidak diizinkan.',
+    };
+  }
+
+  function parseInteger(
+    value: unknown,
+    fallback: number,
+    min: number,
+    max: number
+  ): number | null {
+    if (value === undefined) return fallback;
+    if (typeof value !== 'string' || !/^\d+$/.test(value)) return null;
+
+    const parsed = Number(value);
+
+    if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max) {
+      return null;
+    }
+
+    return parsed;
+  }
+
+  const take = parseInteger(query.take, 25, 1, 100);
+  const skip = parseInteger(query.skip, 0, 0, 1000000);
+
+  if (take === null || skip === null) {
+    return {
+      valid: false,
+      error: 'Parameter take atau skip tidak valid.',
+    };
+  }
+
+  return { valid: true, data: { take, skip } };
+}
+
 
 // Trust proxy configured securely: restrict to 1 hop or explicit setting (never unbounded true)
 const trustProxyEnv = process.env.TRUST_PROXY;
@@ -52,7 +466,7 @@ if (trustProxyEnv === 'true' || trustProxyEnv === '1') {
 }
 app.set('trust proxy', trustProxySetting);
 
-app.use(express.json({ limit: '15mb' }));
+app.use(express.json({ limit: '15mb', verify: (req, _res, buffer) => { if (req.url?.split('?')[0] === '/api/generate-document' && buffer.length > 2 * 1024 * 1024) { const error = new Error('Generator payload too large') as Error & { status: number; code: string }; error.status = 413; error.code = 'GENERATOR_PAYLOAD_TOO_LARGE'; throw error; } } }));
 app.use(cookieParser());
 
 // Helper to extract client IP safely without trusting spoofed forwarded headers unless proxy is trusted
@@ -131,10 +545,12 @@ const CSRF_COOKIE_OPTIONS: express.CookieOptions = {
 // CSRF Token Provider
 app.get('/api/auth/csrf', (req: Request, res: Response) => {
   let token = req.cookies ? req.cookies[CSRF_COOKIE_NAME] : undefined;
-  if (!token) {
+
+  if (!token || !verifyCsrfToken(token)) {
     token = generateCsrfToken();
     res.cookie(CSRF_COOKIE_NAME, token, CSRF_COOKIE_OPTIONS);
   }
+
   res.json({ success: true, csrfToken: token });
 });
 
@@ -228,7 +644,7 @@ app.post('/api/auth/login', requireCsrf, async (req: Request, res: Response) => 
 });
 
 // Logout (current session)
-app.post('/api/auth/logout', async (req: AuthenticatedRequest, res: Response) => {
+app.post('/api/auth/logout', requireCsrf, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const rawToken = req.cookies ? req.cookies[SESSION_COOKIE_NAME] : undefined;
     const ipAddress = getClientIp(req);
@@ -268,7 +684,40 @@ app.post('/api/auth/logout-all', requireAuth, requireCsrf, async (req: Authentic
 // Get current verified session & user info
 app.get('/api/auth/me', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const tenantCtx = await authService.getUserTenantContext(req.user!.id);
+    const headerValue = req.headers['x-institution-id'];
+
+    if (headerValue !== undefined && (typeof headerValue !== 'string' || !headerValue.trim())) {
+      return res.status(400).json({
+        success: false,
+        error: 'X-Institution-Id tidak valid.',
+        code: 'INVALID_INSTITUTION_ID',
+      });
+    }
+
+    const targetInstitutionId = headerValue as string | undefined;
+    const tenantCtx = await authService.getUserTenantContext(
+      req.user!.id,
+      targetInstitutionId
+    );
+
+    if (targetInstitutionId !== undefined) {
+      const validMembership = tenantCtx.userInstitutions.find(
+        (ui: any) =>
+          ui.membership.institutionId === targetInstitutionId &&
+          ui.membership.status === 'ACTIVE'
+      );
+
+      if (!validMembership) {
+        return res.status(403).json({
+          success: false,
+          error: 'Akses ditolak: Anda tidak memiliki keanggotaan aktif pada institusi tersebut.',
+          code: 'TENANT_FORBIDDEN',
+          user: req.user,
+          tenantContext: tenantCtx,
+        });
+      }
+    }
+
     return res.json({
       success: true,
       user: req.user,
@@ -281,11 +730,15 @@ app.get('/api/auth/me', requireAuth, async (req: AuthenticatedRequest, res: Resp
 });
 
 // Forgot password request
-app.post('/api/auth/forgot-password', async (req: Request, res: Response) => {
+app.post('/api/auth/forgot-password', requireCsrf, async (req: Request, res: Response) => {
   try {
     const { email } = req.body;
     const ipAddress = getClientIp(req);
     const result = await authService.requestPasswordReset(email, ipAddress);
+    if (result.retryAfterSeconds) {
+      res.setHeader('Retry-After', String(result.retryAfterSeconds));
+      return res.status(429).json(result);
+    }
     return res.json(result);
   } catch (err: any) {
     console.error('Forgot password error:', err);
@@ -302,6 +755,10 @@ app.post('/api/auth/reset-password', requireCsrf, async (req: Request, res: Resp
     }
     const ipAddress = getClientIp(req);
     const result = await authService.resetPasswordWithToken(token, newPassword, ipAddress);
+    if (result.retryAfterSeconds) {
+      res.setHeader('Retry-After', String(result.retryAfterSeconds));
+      return res.status(429).json(result);
+    }
     if (!result.success) {
       return res.status(400).json(result);
     }
@@ -315,14 +772,214 @@ app.post('/api/auth/reset-password', requireCsrf, async (req: Request, res: Resp
 });
 
 // ==========================================
+
+// ==========================================
+// INSTITUTION ONBOARDING - USER REQUEST API
+// ==========================================
+
+app.post(
+  '/api/institution-requests',
+  requireAuth,
+  requireCsrf,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const validation = validateInstitutionRequestBody(req.body);
+
+      if (!validation.valid) {
+        return res.status(400).json({
+          success: false,
+          error: validation.error,
+        });
+      }
+
+      const request = await institutionOnboardingService.submitRequest({
+        ...validation.data,
+        requesterUserId: req.user!.id,
+        ipAddress: getClientIp(req),
+      });
+
+      return res.status(201).json({ success: true, request });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : '';
+
+      if (
+        message === 'NPSN_ALREADY_REGISTERED' ||
+        message === 'NPSN_REQUEST_ALREADY_PENDING'
+      ) {
+        return res.status(409).json({
+          success: false,
+          error: message === 'NPSN_ALREADY_REGISTERED'
+            ? 'NPSN sudah terdaftar pada institusi.'
+            : 'Pengajuan dengan NPSN tersebut sedang menunggu peninjauan.',
+          code: message,
+        });
+      }
+
+      if (message === 'REQUESTER_NOT_ACTIVE') {
+        return res.status(403).json({
+          success: false,
+          error: 'Akun pengguna tidak aktif.',
+          code: message,
+        });
+      }
+
+      if (message.startsWith('VALIDATION_ERROR:')) {
+        return res.status(400).json({
+          success: false,
+          error: message.replace('VALIDATION_ERROR:', '').trim(),
+          code: 'VALIDATION_ERROR',
+        });
+      }
+
+      console.error('Submit institution request error:', err);
+      return res.status(500).json({
+        success: false,
+        error: 'Gagal mengirim pengajuan institusi.',
+      });
+    }
+  }
+);
+
+app.get(
+  '/api/institution-requests/my',
+  requireAuth,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const pagination = validatePaginationQuery(
+        req.query as Record<string, unknown>
+      );
+
+      if (!pagination.valid) {
+        return res.status(400).json({
+          success: false,
+          error: pagination.error,
+        });
+      }
+
+      const requests = await institutionOnboardingService.getMyRequests(
+        req.user!.id,
+        pagination.data
+      );
+
+      return res.json({
+        success: true,
+        requests,
+        pagination: pagination.data,
+      });
+    } catch (err: unknown) {
+      console.error('List own institution requests error:', err);
+      return res.status(500).json({
+        success: false,
+        error: 'Gagal mengambil daftar pengajuan institusi.',
+      });
+    }
+  }
+);
+
+app.post(
+  '/api/institution-requests/:id/cancel',
+  requireAuth,
+  requireCsrf,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const idValidation = validateInstitutionRequestId(req.params.id);
+
+      if (!idValidation.valid) {
+        return res.status(400).json({
+          success: false,
+          error: idValidation.error,
+        });
+      }
+
+      const request = await institutionOnboardingService.cancelRequest(
+        idValidation.data,
+        req.user!.id,
+        getClientIp(req)
+      );
+
+      return res.json({ success: true, request });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : '';
+
+      if (message === 'INSTITUTION_REQUEST_NOT_FOUND') {
+        return res.status(404).json({
+          success: false,
+          error: 'Pengajuan institusi tidak ditemukan.',
+          code: message,
+        });
+      }
+
+      if (message === 'INSTITUTION_REQUEST_FORBIDDEN') {
+        return res.status(403).json({
+          success: false,
+          error: 'Anda tidak memiliki akses untuk membatalkan pengajuan ini.',
+          code: message,
+        });
+      }
+
+      if (
+        message === 'INSTITUTION_REQUEST_STATE_CONFLICT' ||
+        message === 'INSTITUTION_REQUEST_NOT_PENDING'
+      ) {
+        return res.status(409).json({
+          success: false,
+          error: 'Pengajuan tidak lagi berstatus menunggu peninjauan.',
+          code: message,
+        });
+      }
+
+      if (message.startsWith('VALIDATION_ERROR:')) {
+        return res.status(400).json({
+          success: false,
+          error: message.replace('VALIDATION_ERROR:', '').trim(),
+          code: 'VALIDATION_ERROR',
+        });
+      }
+
+      console.error('Cancel institution request error:', err);
+      return res.status(500).json({
+        success: false,
+        error: 'Gagal membatalkan pengajuan institusi.',
+      });
+    }
+  }
+);
+
 // TENANT & MULTI-USER RBAC API ENDPOINTS
 // ==========================================
 
 // Authenticated Tenant Context
 app.get('/api/tenant/context', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const targetInstitutionId = req.headers['x-institution-id'] as string;
+    const headerValue = req.headers['x-institution-id'];
+
+    if (headerValue !== undefined && (typeof headerValue !== 'string' || !headerValue.trim())) {
+      return res.status(400).json({
+        success: false,
+        error: 'X-Institution-Id tidak valid.',
+        code: 'INVALID_INSTITUTION_ID',
+      });
+    }
+
+    const targetInstitutionId = headerValue as string | undefined;
     const tenantCtx = await authService.getUserTenantContext(req.user!.id, targetInstitutionId);
+
+    if (targetInstitutionId !== undefined) {
+      const validMembership = tenantCtx.userInstitutions.find(
+        (ui: any) =>
+          ui.membership.institutionId === targetInstitutionId &&
+          ui.membership.status === 'ACTIVE'
+      );
+
+      if (!validMembership) {
+        return res.status(403).json({
+          success: false,
+          error: 'Akses ditolak: Anda tidak memiliki keanggotaan aktif pada institusi tersebut.',
+          code: 'TENANT_FORBIDDEN',
+        });
+      }
+    }
+
     return res.json({
       success: true,
       context: tenantCtx,
@@ -361,7 +1018,7 @@ app.post('/api/tenant/user-profile', requireAuth, requireCsrf, async (req: Authe
       };
     }
 
-    return res.json({ success: true, user });
+    return res.json({ success: true, user: toSafeUserProfile(user) });
   } catch (err: any) {
     console.error('Update user profile error:', err);
     return res.status(500).json({ success: false, error: 'Gagal memperbarui profil pengguna' });
@@ -427,17 +1084,25 @@ app.post(
   requireRole(['SUPER_ADMIN', 'SCHOOL_ADMIN']),
   async (req: AuthenticatedRequest, res: Response) => {
     try {
-      const { targetUserId, newRole, newStatus } = req.body;
-      if (!targetUserId) {
-        return res.status(400).json({ success: false, error: 'targetUserId wajib disertakan.' });
+      const validation = validateMembershipUpdateBody(
+        { ...req.body, institutionId: req.institutionId },
+        'targetUserId'
+      );
+
+      if (!validation.valid) {
+        return res.status(400).json({
+          success: false,
+          error: validation.error,
+        });
       }
+
       const ipAddress = getClientIp(req);
       const result = await authService.updateMembership({
         callerUserId: req.user!.id,
-        targetUserId,
-        institutionId: req.institutionId!,
-        newRole,
-        newStatus,
+        targetUserId: validation.data.userId,
+        institutionId: validation.data.institutionId,
+        newRole: validation.data.newRole,
+        newStatus: validation.data.newStatus,
         ipAddress,
       });
 
@@ -452,21 +1117,307 @@ app.post(
   }
 );
 
+
+// List pending membership requests for the verified institution.
+app.get(
+  '/api/tenant/membership-requests',
+  requireAuth,
+  requireInstitutionMembership,
+  requireRole(['SUPER_ADMIN', 'SCHOOL_ADMIN']),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const pagination = validatePaginationQuery(
+        req.query as Record<string, unknown>
+      );
+
+      if (!pagination.valid) {
+        return res.status(400).json({
+          success: false,
+          error: pagination.error,
+          code: 'VALIDATION_ERROR',
+        });
+      }
+
+      const requests = await membershipApprovalService.listPending({
+        institutionId: req.institutionId!,
+        actorUserId: req.user!.id,
+        ...pagination.data,
+      });
+
+      return res.json({
+        success: true,
+        requests,
+        pagination: pagination.data,
+      });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : '';
+
+      if (message.startsWith('VALIDATION_ERROR:')) {
+        return res.status(400).json({
+          success: false,
+          error: message.replace('VALIDATION_ERROR:', '').trim(),
+          code: 'VALIDATION_ERROR',
+        });
+      }
+
+      if (
+        message === 'REVIEWER_NOT_ACTIVE' ||
+        message === 'REVIEWER_MEMBERSHIP_NOT_ACTIVE' ||
+        message === 'REVIEWER_NOT_AUTHORIZED'
+      ) {
+        return res.status(403).json({
+          success: false,
+          error: 'Akun atau hak akses tidak memenuhi persyaratan.',
+          code: message,
+        });
+      }
+
+      console.error('List pending membership requests error:', err);
+      return res.status(500).json({
+        success: false,
+        error: 'Gagal mengambil daftar permintaan keanggotaan.',
+      });
+    }
+  }
+);
+
+// Approve a pending membership request.
+// The applicant's existing role is preserved by the service.
+app.post(
+  '/api/tenant/membership-requests/:id/approve',
+  requireAuth,
+  requireCsrf,
+  requireInstitutionMembership,
+  requireRole(['SUPER_ADMIN', 'SCHOOL_ADMIN']),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const idValidation = validateInstitutionRequestId(req.params.id);
+
+      if (!idValidation.valid) {
+        return res.status(400).json({
+          success: false,
+          error: idValidation.error,
+          code: 'VALIDATION_ERROR',
+        });
+      }
+
+      // Approval accepts no client-controlled fields.
+      if (
+        req.body !== undefined &&
+        req.body !== null &&
+        (!isPlainObject(req.body) || Object.keys(req.body).length > 0)
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: 'Body persetujuan tidak boleh memuat field tambahan.',
+          code: 'VALIDATION_ERROR',
+        });
+      }
+
+      const membership = await membershipApprovalService.approve({
+        membershipId: idValidation.data,
+        institutionId: req.institutionId!,
+        actorUserId: req.user!.id,
+        ipAddress: getClientIp(req),
+      });
+
+      return res.json({
+        success: true,
+        membership,
+      });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : '';
+
+      if (message === 'MEMBERSHIP_REQUEST_NOT_FOUND') {
+        return res.status(404).json({
+          success: false,
+          error: 'Permintaan keanggotaan tidak ditemukan.',
+          code: message,
+        });
+      }
+
+      if (message === 'MEMBERSHIP_REQUEST_STATE_CONFLICT') {
+        return res.status(409).json({
+          success: false,
+          error: 'Permintaan keanggotaan tidak lagi berstatus menunggu.',
+          code: message,
+        });
+      }
+
+      if (
+        message === 'REVIEWER_NOT_ACTIVE' ||
+        message === 'REVIEWER_MEMBERSHIP_NOT_ACTIVE' ||
+        message === 'REVIEWER_NOT_AUTHORIZED' ||
+        message === 'APPLICANT_NOT_ACTIVE'
+      ) {
+        return res.status(403).json({
+          success: false,
+          error: 'Akun atau hak akses tidak memenuhi persyaratan.',
+          code: message,
+        });
+      }
+
+      if (message.startsWith('VALIDATION_ERROR:')) {
+        return res.status(400).json({
+          success: false,
+          error: message.replace('VALIDATION_ERROR:', '').trim(),
+          code: 'VALIDATION_ERROR',
+        });
+      }
+
+      console.error('Approve membership request error:', err);
+      return res.status(500).json({
+        success: false,
+        error: 'Gagal menyetujui permintaan keanggotaan.',
+      });
+    }
+  }
+);
+
+// Reject a pending membership request.
+// Rejection reason is optional and limited to 1000 characters.
+app.post(
+  '/api/tenant/membership-requests/:id/reject',
+  requireAuth,
+  requireCsrf,
+  requireInstitutionMembership,
+  requireRole(['SUPER_ADMIN', 'SCHOOL_ADMIN']),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const idValidation = validateInstitutionRequestId(req.params.id);
+
+      if (!idValidation.valid) {
+        return res.status(400).json({
+          success: false,
+          error: idValidation.error,
+          code: 'VALIDATION_ERROR',
+        });
+      }
+
+      let reason: string | undefined;
+
+      if (req.body !== undefined && req.body !== null) {
+        if (!isPlainObject(req.body)) {
+          return res.status(400).json({
+            success: false,
+            error: 'Format alasan penolakan tidak valid.',
+            code: 'VALIDATION_ERROR',
+          });
+        }
+
+        if (
+          Object.keys(req.body).some((key) => key !== 'rejectionReason')
+        ) {
+          return res.status(400).json({
+            success: false,
+            error: 'Terdapat field penolakan yang tidak diizinkan.',
+            code: 'VALIDATION_ERROR',
+          });
+        }
+
+        const reasonValidation = readOptionalText(
+          req.body,
+          'rejectionReason',
+          'Alasan penolakan',
+          1000
+        );
+
+        if (!reasonValidation.valid) {
+          return res.status(400).json({
+            success: false,
+            error: reasonValidation.error,
+            code: 'VALIDATION_ERROR',
+          });
+        }
+
+        reason = reasonValidation.data ?? undefined;
+      }
+
+      const membership = await membershipApprovalService.reject({
+        membershipId: idValidation.data,
+        institutionId: req.institutionId!,
+        actorUserId: req.user!.id,
+        ipAddress: getClientIp(req),
+        reason,
+      });
+
+      return res.json({
+        success: true,
+        membership,
+      });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : '';
+
+      if (message === 'MEMBERSHIP_REQUEST_NOT_FOUND') {
+        return res.status(404).json({
+          success: false,
+          error: 'Permintaan keanggotaan tidak ditemukan.',
+          code: message,
+        });
+      }
+
+      if (message === 'MEMBERSHIP_REQUEST_STATE_CONFLICT') {
+        return res.status(409).json({
+          success: false,
+          error: 'Permintaan keanggotaan tidak lagi berstatus menunggu.',
+          code: message,
+        });
+      }
+
+      if (
+        message === 'REVIEWER_NOT_ACTIVE' ||
+        message === 'REVIEWER_MEMBERSHIP_NOT_ACTIVE' ||
+        message === 'REVIEWER_NOT_AUTHORIZED'
+      ) {
+        return res.status(403).json({
+          success: false,
+          error: 'Akun atau hak akses tidak memenuhi persyaratan.',
+          code: message,
+        });
+      }
+
+      if (message.startsWith('VALIDATION_ERROR:')) {
+        return res.status(400).json({
+          success: false,
+          error: message.replace('VALIDATION_ERROR:', '').trim(),
+          code: 'VALIDATION_ERROR',
+        });
+      }
+
+      console.error('Reject membership request error:', err);
+      return res.status(500).json({
+        success: false,
+        error: 'Gagal menolak permintaan keanggotaan.',
+      });
+    }
+  }
+);
+
 // Switch active institution (verified against user's server memberships)
 app.post('/api/tenant/switch-institution', requireAuth, requireCsrf, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { institutionId } = req.body;
-    if (!institutionId) {
-      return res.status(400).json({ success: false, error: 'Institution ID wajib disertakan.' });
+    const { institutionId } = req.body || {};
+
+    if (typeof institutionId !== 'string' || !institutionId.trim()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Institution ID wajib berupa string yang valid.',
+        code: 'INVALID_INSTITUTION_ID',
+      });
     }
 
     const tenantCtx = await authService.getUserTenantContext(req.user!.id, institutionId);
-    const validMem = tenantCtx.userInstitutions.find((ui: any) => ui.membership.institutionId === institutionId);
+    const validMem = tenantCtx.userInstitutions.find(
+      (ui: any) =>
+        ui.membership.institutionId === institutionId &&
+        ui.membership.status === 'ACTIVE'
+    );
 
     if (!validMem) {
       return res.status(403).json({
         success: false,
-        error: 'Akses ditolak: Anda bukan anggota dari institusi tersebut.',
+        error: 'Akses ditolak: Anda tidak memiliki keanggotaan aktif pada institusi tersebut.',
+        code: 'TENANT_FORBIDDEN',
       });
     }
 
@@ -765,6 +1716,8 @@ app.post(
         });
       }
 
+      const projectAccessUserId = isOwner ? req.user!.id : undefined;
+
       const { teacherInput, content } = req.body;
       if (!teacherInput || typeof teacherInput !== 'object' || !teacherInput.materiPokok) {
         return res.status(400).json({
@@ -776,7 +1729,7 @@ app.post(
       const record = await modulAjarRepository.createModulAjar(
         projectId,
         req.institutionId!,
-        req.user!.id,
+        projectAccessUserId,
         teacherInput,
         content
       );
@@ -825,13 +1778,15 @@ app.get(
         });
       }
 
+      const projectAccessUserId = isOwner ? req.user!.id : undefined;
+
       const limit = Math.min(Math.max(parseInt(req.query.limit as string) || 50, 1), 100);
       const offset = Math.max(parseInt(req.query.offset as string) || 0, 0);
 
       const result = await modulAjarRepository.listModulAjar(
         projectId,
         req.institutionId!,
-        req.user!.id,
+        projectAccessUserId,
         limit,
         offset
       );
@@ -852,11 +1807,34 @@ app.get(
   async (req: AuthenticatedRequest, res: Response) => {
     try {
       const { id: projectId, documentId } = req.params;
+      const existing = await projectRepository.findProjectByIdAndInstitution(
+        projectId,
+        req.institutionId!
+      );
+
+      if (!existing) {
+        return res.status(404).json({
+          success: false,
+          error: 'Proyek tidak ditemukan atau akses ditolak.',
+          code: 'PROJECT_NOT_FOUND',
+        });
+      }
+
+      const isOwner = existing.userId === req.user!.id;
+      if (!canViewProject(req.membership!.role, isOwner)) {
+        return res.status(403).json({
+          success: false,
+          error: 'Akses ditolak: Anda tidak memiliki izin melihat dokumen proyek ini.',
+          code: 'INSUFFICIENT_PROJECT_VIEW_PERMISSION',
+        });
+      }
+
+      const projectAccessUserId = isOwner ? req.user!.id : undefined;
       const record = await modulAjarRepository.getModulAjarById(
         projectId,
         documentId,
         req.institutionId!,
-        req.user!.id
+        projectAccessUserId
       );
 
       if (!record) {
@@ -903,12 +1881,14 @@ app.put(
         });
       }
 
+      const projectAccessUserId = isOwner ? req.user!.id : undefined;
+
       const { title, content, status, changelog, teacherInput, expectedProjectUpdatedAt } = req.body;
       const updated = await modulAjarRepository.updateModulAjar(
         projectId,
         documentId,
         req.institutionId!,
-        req.user!.id,
+        projectAccessUserId,
         { title, content, status, changelog, teacherInput, expectedProjectUpdatedAt }
       );
 
@@ -964,6 +1944,8 @@ app.post(
         });
       }
 
+      const projectAccessUserId = isOwner ? req.user!.id : undefined;
+
       const { mode, sourceModuleId, materiPokok, teacherInput, content } = req.body;
       if (!materiPokok || typeof materiPokok !== 'string') {
         return res.status(400).json({
@@ -975,7 +1957,7 @@ app.post(
       const record = await modulAjarRepository.createLkpd(
         projectId,
         req.institutionId!,
-        req.user!.id,
+        projectAccessUserId,
         {
           mode: mode || 'FROM_ACADEMIC_DATA',
           sourceModuleId,
@@ -1029,13 +2011,15 @@ app.get(
         });
       }
 
+      const projectAccessUserId = isOwner ? req.user!.id : undefined;
+
       const limit = Math.min(Math.max(parseInt(req.query.limit as string) || 50, 1), 100);
       const offset = Math.max(parseInt(req.query.offset as string) || 0, 0);
 
       const result = await modulAjarRepository.listLkpd(
         projectId,
         req.institutionId!,
-        req.user!.id,
+        projectAccessUserId,
         limit,
         offset
       );
@@ -1056,11 +2040,34 @@ app.get(
   async (req: AuthenticatedRequest, res: Response) => {
     try {
       const { id: projectId, documentId } = req.params;
+      const existing = await projectRepository.findProjectByIdAndInstitution(
+        projectId,
+        req.institutionId!
+      );
+
+      if (!existing) {
+        return res.status(404).json({
+          success: false,
+          error: 'Proyek tidak ditemukan atau akses ditolak.',
+          code: 'PROJECT_NOT_FOUND',
+        });
+      }
+
+      const isOwner = existing.userId === req.user!.id;
+      if (!canViewProject(req.membership!.role, isOwner)) {
+        return res.status(403).json({
+          success: false,
+          error: 'Akses ditolak: Anda tidak memiliki izin melihat dokumen proyek ini.',
+          code: 'INSUFFICIENT_PROJECT_VIEW_PERMISSION',
+        });
+      }
+
+      const projectAccessUserId = isOwner ? req.user!.id : undefined;
       const record = await modulAjarRepository.getLkpdById(
         projectId,
         documentId,
         req.institutionId!,
-        req.user!.id
+        projectAccessUserId
       );
 
       if (!record) {
@@ -1107,12 +2114,14 @@ app.put(
         });
       }
 
+      const projectAccessUserId = isOwner ? req.user!.id : undefined;
+
       const { title, content, status, changelog, teacherInput, expectedProjectUpdatedAt } = req.body;
       const updated = await modulAjarRepository.updateLkpd(
         projectId,
         documentId,
         req.institutionId!,
-        req.user!.id,
+        projectAccessUserId,
         { title, content, status, changelog, teacherInput, expectedProjectUpdatedAt }
       );
 
@@ -1172,6 +2181,8 @@ app.post(
         });
       }
 
+      const projectAccessUserId = isOwner ? req.user!.id : undefined;
+
       const {
         materiPokok,
         gayaMengajar,
@@ -1207,7 +2218,7 @@ app.post(
       const mapping = await academicMappingService.mapAcademicSources(
         projectId,
         req.institutionId!,
-        req.user!.id,
+        projectAccessUserId,
         teacherInput
       );
 
@@ -1218,7 +2229,7 @@ app.post(
       const record = await modulAjarRepository.createModulAjar(
         projectId,
         req.institutionId!,
-        req.user!.id,
+        projectAccessUserId,
         teacherInput,
         genResult.content,
         { expectedProjectUpdatedAt }
@@ -1291,6 +2302,8 @@ app.post(
         });
       }
 
+      const projectAccessUserId = isOwner ? req.user!.id : undefined;
+
       const { mode, sourceModuleId, materiPokok, teacherInput, expectedProjectUpdatedAt } = req.body;
 
       if (!materiPokok || typeof materiPokok !== 'string' || materiPokok.trim().length === 0) {
@@ -1317,7 +2330,7 @@ app.post(
           projectId,
           sourceModuleId,
           req.institutionId!,
-          req.user!.id
+          projectAccessUserId
         );
         if (!targetModuleRecord) {
           return res.status(404).json({
@@ -1340,7 +2353,7 @@ app.post(
       const mapping = await academicMappingService.mapAcademicSources(
         projectId,
         req.institutionId!,
-        req.user!.id,
+        projectAccessUserId,
         inputForMapping
       );
 
@@ -1355,7 +2368,7 @@ app.post(
       const record = await modulAjarRepository.createLkpd(
         projectId,
         req.institutionId!,
-        req.user!.id,
+        projectAccessUserId,
         {
           mode: lkpdMode,
           sourceModuleId: lkpdMode === 'FROM_MODULE' ? sourceModuleId : undefined,
@@ -1478,38 +2491,130 @@ app.post('/api/tenant/switch-user', (_req: Request, res: Response) => {
 
 
 
+function generateDeterministicGeneratorDocument(
+  request: ValidatedGeneratorRequest
+): AnyDocumentContent {
+  const { docType, masterInput, previousDocs } = request;
+
+  switch (docType) {
+    case 'ACP':
+      return generateDeterministicACP(masterInput);
+    case 'TP':
+      return generateDeterministicTP(
+        masterInput,
+        previousDocs.ACP?.content as AcpData
+      );
+    case 'ATP':
+      return generateDeterministicATP(
+        masterInput,
+        previousDocs.TP?.content as TpData
+      );
+    case 'PROTA':
+      return generateDeterministicPROTA(
+        masterInput,
+        previousDocs.ATP?.content as AtpData
+      );
+    case 'PROSEM':
+      return generateDeterministicPROSEM(
+        masterInput,
+        previousDocs.PROTA?.content as ProtaData
+      );
+    case 'KKTP':
+      return generateDeterministicKKTP(
+        masterInput,
+        previousDocs.TP?.content as TpData
+      );
+    default:
+      throw new Error('Jenis dokumen generator tidak dikenal.');
+  }
+}
+
 // Generate document endpoint (Stateless Utility Endpoint with Input Validation & Size Limits)
-app.post('/api/generate-document', async (req: Request, res: Response) => {
+app.post('/api/generate-document', requireAuth, requireCsrf, async (req: AuthenticatedRequest, res: Response) => {
+  const requestId = randomUUID();
+  const startedAt = Date.now();
+  let quotaConsumed = false;
+  let docTypeForAudit: string | undefined;
+
   try {
-    // 1. Payload size check (Max 2MB)
-    const payloadLength = JSON.stringify(req.body || {}).length;
-    if (payloadLength > 2 * 1024 * 1024) {
-      return res.status(400).json({ success: false, error: 'Ukuran payload permintaan melebihi batas maksimum 2MB.' });
+    const userId = req.user?.id;
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        code: 'AUTHENTICATION_REQUIRED',
+        error: 'Sesi autentikasi tidak valid. Silakan login kembali.',
+      });
     }
 
-    const { docType, masterInput, previousDocs } = req.body;
+    const quotaContext = {
+      userId,
+      clientIp: getClientIp(req),
+    };
 
-    // 2. Strict Input & Whitelist Validation
-    const ALLOWED_DOC_TYPES = ['ACP', 'TP', 'ATP', 'PROTA', 'PROSEM', 'KKTP'];
-    if (!docType || typeof docType !== 'string' || !ALLOWED_DOC_TYPES.includes(docType.toUpperCase())) {
+    try {
+      await generatorQuotaService.consumeIpQuota(quotaContext);
+    } catch (error) {
+      if (error instanceof GeneratorQuotaServiceError) {
+        if (error.retryAfterSeconds) {
+          res.setHeader('Retry-After', String(error.retryAfterSeconds));
+        }
+
+        return res.status(error.statusCode).json({
+          success: false,
+          code: error.code,
+          error: error.code === 'IP_RATE_LIMITED'
+            ? 'Batas permintaan dari jaringan Anda telah tercapai. Silakan coba kembali nanti.'
+            : 'Layanan pembatasan penggunaan sementara tidak tersedia.',
+        });
+      }
+
+      return res.status(503).json({
+        success: false,
+        code: 'QUOTA_SERVICE_UNAVAILABLE',
+        error: 'Layanan pembatasan penggunaan sementara tidak tersedia.',
+      });
+    }
+
+    const validation = validateGeneratorRequest(req.body);
+
+    if (!validation.valid) {
       return res.status(400).json({
         success: false,
-        error: `docType tidak valid. Harus salah satu dari: [${ALLOWED_DOC_TYPES.join(', ')}].`,
+        code: validation.code,
+        error: validation.error,
       });
     }
 
-    if (!masterInput || typeof masterInput !== 'object' || Array.isArray(masterInput)) {
-      return res.status(400).json({ success: false, error: 'masterInput wajib berupa objek JSON valid.' });
-    }
+    const { docType, masterInput, previousDocs } = validation.data;
+    docTypeForAudit = docType;
 
-    if (!aiClient) {
-      // Fallback flag when API key is not present so frontend can use deterministic generator
-      return res.json({
-        success: false,
-        fallbackRequired: true,
-        message: 'No GEMINI_API_KEY found, fallback to educational algorithm generator',
-      });
-    }
+    // Typed references: prerequisite validation guarantees the document types.
+    const previousTp = previousDocs.TP?.content as TpData | null | undefined;
+    const previousAtp = previousDocs.ATP?.content as AtpData | null | undefined;
+    const previousProta = previousDocs.PROTA?.content as ProtaData | null | undefined;
+
+    const generated = await generatorQuotaService.runWithUserQuota(
+      quotaContext,
+      async () => {
+        quotaConsumed = true;
+
+        const createDeterministicFallback = () => {
+          const fallbackOutput = generateDeterministicGeneratorDocument(validation.data);
+          const fallbackValidation = validateGeneratorOutput(docType, fallbackOutput);
+
+          if (!fallbackValidation.valid) {
+            throw new Error('DETERMINISTIC_FALLBACK_INVALID');
+          }
+
+          return {
+            data: fallbackValidation.data,
+            source: 'algorithmic_engine' as const,
+          };
+        };
+
+        if (!aiClient) {
+          return createDeterministicFallback();
+        }
 
     // Prepare system instructions and prompt based on docType
     const systemPrompt = `Anda adalah pakar kurikulum madrasah Kementerian Agama RI, Kurikulum Merdeka, dan Kurikulum Berbasis Cinta (KBC) serta Profil Pelajar Rahmatan lil 'Alamin (PPRA).
@@ -1593,7 +2698,7 @@ Format JSON:
 }`;
     } else if (docType === 'ATP') {
       userPrompt = `Susun Alur Tujuan Pembelajaran (ATP) berdasarkan TP berikut:
-TP List: ${JSON.stringify(previousDocs?.TP?.content?.listTP || [])}
+TP List: ${JSON.stringify(previousTp?.listTP || [])}
 Total JP: ${masterInput.alokasiWaktuTotal} JP.
 Bagi alur TP ke dalam 4 tahapan logis (Tahap 1 & 2 di Semester 1, Tahap 3 & 4 di Semester 2).
 
@@ -1630,7 +2735,7 @@ Format JSON:
       userPrompt = `Susun Program Tahunan (PROTA) berdasarkan ATP dan Kalender Pendidikan:
 Kalender Sem 1: ${JSON.stringify(masterInput.kalenderSemester1)}
 Kalender Sem 2: ${JSON.stringify(masterInput.kalenderSemester2)}
-ATP List: ${JSON.stringify(previousDocs?.ATP?.content?.listATP || [])}
+ATP List: ${JSON.stringify(previousAtp?.listATP || [])}
 Target JP Total: ${masterInput.alokasiWaktuTotal} JP.
 
 Format JSON:
@@ -1661,7 +2766,7 @@ Format JSON:
 }`;
     } else if (docType === 'PROSEM') {
       userPrompt = `Susun Program Semester (PROSEM) berdasarkan PROTA:
-PROTA Rencana Alokasi: ${JSON.stringify(previousDocs?.PROTA?.content?.rencanaAlokasi || [])}
+PROTA Rencana Alokasi: ${JSON.stringify(previousProta?.rencanaAlokasi || [])}
 Kalender Sem 1: ${JSON.stringify(masterInput.kalenderSemester1)}
 Kalender Sem 2: ${JSON.stringify(masterInput.kalenderSemester2)}
 Setiap bulan memiliki 5 minggu (W1 s/d W5). Distribusikan 2 JP per minggu efektif. Berikan tanda 0 untuk minggu tidak efektif.
@@ -1707,7 +2812,7 @@ Format JSON:
 }`;
     } else if (docType === 'KKTP') {
       userPrompt = `Susun Kriteria Ketercapaian Tujuan Pembelajaran (KKTP) berdasarkan daftar TP:
-List TP: ${JSON.stringify(previousDocs?.TP?.content?.listTP || [])}
+List TP: ${JSON.stringify(previousTp?.listTP || [])}
 Karakteristik & Asesmen: ${masterInput.strategiAsesmen}
 
 Format JSON:
@@ -1742,39 +2847,125 @@ Format JSON:
 }`;
     }
 
-    const response = await aiClient.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: userPrompt,
-      config: {
-        systemInstruction: systemPrompt,
-        responseMimeType: 'application/json',
+        try {
+          const response = await aiClient.models.generateContent({
+            model: 'gemini-3.8-flash',
+            contents: userPrompt,
+            config: {
+              systemInstruction: systemPrompt,
+              responseMimeType: 'application/json',
+              httpOptions: {
+                timeout: 60_000,
+              },
+            },
+          });
+
+          const text = response.text || '{}';
+          let parsedData: unknown;
+
+          try {
+            parsedData = JSON.parse(text);
+          } catch {
+            const jsonMatch = text.match(/\{[\s\S]*\}/);
+
+            if (!jsonMatch) {
+              throw new Error('GEMINI_INVALID_JSON');
+            }
+
+            parsedData = JSON.parse(jsonMatch[0]);
+          }
+
+          const outputValidation = validateGeneratorOutput(docType, parsedData);
+
+          if (!outputValidation.valid) {
+            throw new Error('GEMINI_OUTPUT_VALIDATION_FAILED');
+          }
+
+          return {
+            data: outputValidation.data,
+            source: 'gemini_ai' as const,
+          };
+        } catch (geminiError) {
+          console.warn('Generator Gemini failed; using deterministic fallback', {
+            requestId,
+            docType,
+            errorName: geminiError instanceof Error ? geminiError.name : 'UnknownError',
+          });
+
+          return createDeterministicFallback();
+        }
+      }
+    );
+
+    await auditLogRepository.logAction({
+      userId,
+      action: 'GENERATOR_DOCUMENT_CREATED',
+      resource: 'GeneratorDocument',
+      details: {
+        requestId,
+        docType,
+        source: generated.source,
+        status: 'SUCCESS',
+        durationMs: Date.now() - startedAt,
+        quotaConsumed: true,
       },
     });
 
-    const text = response.text || '{}';
-    let parsedData: any;
-    try {
-      parsedData = JSON.parse(text);
-    } catch {
-      // If parsing fails, extract potential JSON block
-      const jsonMatch = text.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        parsedData = JSON.parse(jsonMatch[0]);
-      } else {
-        throw new Error('AI returned non-JSON response');
-      }
-    }
-
     return res.json({
       success: true,
-      data: parsedData,
+      data: generated.data,
+      source: generated.source,
+      requestId,
     });
-  } catch (err: any) {
-    console.error('Error generating document:', err);
+  } catch (error: unknown) {
+    const durationMs = Date.now() - startedAt;
+
+    if (error instanceof GeneratorQuotaServiceError) {
+      if (error.retryAfterSeconds) {
+        res.setHeader('Retry-After', String(error.retryAfterSeconds));
+      }
+
+      const safeMessages: Record<string, string> = {
+        USER_QUOTA_EXCEEDED: 'Kuota pembuatan dokumen Anda telah tercapai.',
+        GENERATION_IN_PROGRESS: 'Anda masih memiliki proses pembuatan dokumen yang berjalan.',
+        QUOTA_SERVICE_UNAVAILABLE: 'Layanan pembatasan penggunaan sementara tidak tersedia.',
+      };
+
+      return res.status(error.statusCode).json({
+        success: false,
+        code: error.code,
+        error: safeMessages[error.code] || 'Permintaan generator tidak dapat diproses.',
+        requestId,
+      });
+    }
+
+    if (quotaConsumed && docTypeForAudit) {
+      await auditLogRepository.logAction({
+        userId: req.user?.id,
+        action: 'GENERATOR_DOCUMENT_FAILED',
+        resource: 'GeneratorDocument',
+        details: {
+          requestId,
+          docType: docTypeForAudit,
+          status: 'FAILED',
+          durationMs,
+          quotaConsumed: true,
+          errorCode: 'GENERATOR_FAILED',
+        },
+      });
+    }
+
+    console.error('Generator document request failed', {
+      requestId,
+      docType: docTypeForAudit,
+      errorName: error instanceof Error ? error.name : 'UnknownError',
+    });
+
     return res.status(500).json({
       success: false,
-      error: err.message || 'Internal server error while generating document',
-      fallbackRequired: true,
+      code: 'GENERATOR_FAILED',
+      error: 'Dokumen gagal dibuat. Silakan coba kembali.',
+      requestId,
     });
   }
 });
@@ -1785,6 +2976,284 @@ Format JSON:
 
 import { requireSuperAdmin } from './src/middleware/authMiddleware.js';
 import { platformAdminService } from './src/services/platformAdminService.js';
+
+
+// ==========================================
+// INSTITUTION ONBOARDING - PLATFORM REVIEW API
+// SUPER ADMIN ONLY
+// ==========================================
+
+// List pending institution registration requests.
+app.get(
+  '/api/platform/institution-requests',
+  requireAuth,
+  requireSuperAdmin,
+  async (req: Request, res: Response) => {
+    try {
+      const pagination = validatePaginationQuery(
+        req.query as Record<string, unknown>
+      );
+
+      if (!pagination.valid) {
+        return res.status(400).json({
+          success: false,
+          error: pagination.error,
+        });
+      }
+
+      const requests = await institutionOnboardingService.listPendingRequests(
+        pagination.data
+      );
+
+      return res.json({
+        success: true,
+        requests,
+        pagination: pagination.data,
+      });
+    } catch (err: unknown) {
+      console.error('Platform list institution requests error:', err);
+      return res.status(500).json({
+        success: false,
+        error: 'Gagal mengambil daftar pengajuan institusi.',
+      });
+    }
+  }
+);
+
+// Get one institution request detail.
+app.get(
+  '/api/platform/institution-requests/:id',
+  requireAuth,
+  requireSuperAdmin,
+  async (req: Request, res: Response) => {
+    try {
+      const idValidation = validateInstitutionRequestId(req.params.id);
+
+      if (!idValidation.valid) {
+        return res.status(400).json({
+          success: false,
+          error: idValidation.error,
+        });
+      }
+
+      const request = await institutionOnboardingService.getRequestDetail(
+        idValidation.data
+      );
+
+      return res.json({ success: true, request });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : '';
+
+      if (message === 'INSTITUTION_REQUEST_NOT_FOUND') {
+        return res.status(404).json({
+          success: false,
+          error: 'Pengajuan institusi tidak ditemukan.',
+          code: message,
+        });
+      }
+
+      console.error('Platform institution request detail error:', err);
+      return res.status(500).json({
+        success: false,
+        error: 'Gagal mengambil detail pengajuan institusi.',
+      });
+    }
+  }
+);
+
+// Approve a pending request and assign its requester as SCHOOL_ADMIN.
+app.post(
+  '/api/platform/institution-requests/:id/approve',
+  requireAuth,
+  requireCsrf,
+  requireSuperAdmin,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const idValidation = validateInstitutionRequestId(req.params.id);
+
+      if (!idValidation.valid) {
+        return res.status(400).json({
+          success: false,
+          error: idValidation.error,
+        });
+      }
+
+      if (
+        req.body !== undefined &&
+        (!isPlainObject(req.body) || Object.keys(req.body).length !== 0)
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: 'Endpoint persetujuan tidak menerima field tambahan.',
+        });
+      }
+
+      const request = await institutionOnboardingService.approveRequest({
+        requestId: idValidation.data,
+        reviewerUserId: req.user!.id,
+        ipAddress: getClientIp(req),
+      });
+
+      return res.json({
+        success: true,
+        request,
+        message: 'Pengajuan disetujui dan pemohon ditetapkan sebagai School Admin.',
+      });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : '';
+
+      if (message === 'REVIEWER_NOT_PLATFORM_SUPER_ADMIN') {
+        return res.status(403).json({
+          success: false,
+          error: 'Akses ditolak: reviewer harus memiliki hak Platform Super Admin aktif.',
+          code: message,
+        });
+      }
+
+      if (message === 'INSTITUTION_REQUEST_NOT_FOUND') {
+        return res.status(404).json({
+          success: false,
+          error: 'Pengajuan institusi tidak ditemukan.',
+          code: message,
+        });
+      }
+
+      if (
+        message === 'INSTITUTION_REQUEST_STATE_CONFLICT' ||
+        message === 'INSTITUTION_REQUEST_NOT_PENDING'
+      ) {
+        return res.status(409).json({
+          success: false,
+          error: 'Pengajuan tidak lagi berstatus menunggu peninjauan.',
+          code: message,
+        });
+      }
+
+      if (message === 'NPSN_ALREADY_REGISTERED') {
+        return res.status(409).json({
+          success: false,
+          error: 'NPSN sudah terdaftar pada institusi lain.',
+          code: message,
+        });
+      }
+
+      if (message === 'REQUESTER_NOT_ACTIVE') {
+        return res.status(409).json({
+          success: false,
+          error: 'Akun pemohon tidak aktif.',
+          code: message,
+        });
+      }
+
+      if (message === 'REVIEWER_NOT_ACTIVE') {
+        return res.status(403).json({
+          success: false,
+          error: 'Akun reviewer tidak aktif.',
+          code: message,
+        });
+      }
+
+      console.error('Platform approve institution request error:', err);
+      return res.status(500).json({
+        success: false,
+        error: 'Gagal menyetujui pengajuan institusi.',
+      });
+    }
+  }
+);
+
+// Reject a pending request with a mandatory reason.
+app.post(
+  '/api/platform/institution-requests/:id/reject',
+  requireAuth,
+  requireCsrf,
+  requireSuperAdmin,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const idValidation = validateInstitutionRequestId(req.params.id);
+
+      if (!idValidation.valid) {
+        return res.status(400).json({
+          success: false,
+          error: idValidation.error,
+        });
+      }
+
+      const bodyValidation = validateInstitutionRequestRejectionBody(req.body);
+
+      if (!bodyValidation.valid) {
+        return res.status(400).json({
+          success: false,
+          error: bodyValidation.error,
+        });
+      }
+
+      const request = await institutionOnboardingService.rejectRequest({
+        requestId: idValidation.data,
+        reviewerUserId: req.user!.id,
+        rejectionReason: bodyValidation.data.rejectionReason,
+        ipAddress: getClientIp(req),
+      });
+
+      return res.json({
+        success: true,
+        request,
+        message: 'Pengajuan institusi berhasil ditolak.',
+      });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : '';
+
+      if (message === 'REVIEWER_NOT_PLATFORM_SUPER_ADMIN') {
+        return res.status(403).json({
+          success: false,
+          error: 'Akses ditolak: reviewer harus memiliki hak Platform Super Admin aktif.',
+          code: message,
+        });
+      }
+
+      if (message === 'INSTITUTION_REQUEST_NOT_FOUND') {
+        return res.status(404).json({
+          success: false,
+          error: 'Pengajuan institusi tidak ditemukan.',
+          code: message,
+        });
+      }
+
+      if (
+        message === 'INSTITUTION_REQUEST_STATE_CONFLICT' ||
+        message === 'INSTITUTION_REQUEST_NOT_PENDING'
+      ) {
+        return res.status(409).json({
+          success: false,
+          error: 'Pengajuan tidak lagi berstatus menunggu peninjauan.',
+          code: message,
+        });
+      }
+
+      if (message === 'REVIEWER_NOT_ACTIVE') {
+        return res.status(403).json({
+          success: false,
+          error: 'Akun reviewer tidak aktif.',
+          code: message,
+        });
+      }
+
+      if (message.startsWith('VALIDATION_ERROR:')) {
+        return res.status(400).json({
+          success: false,
+          error: message.replace('VALIDATION_ERROR:', '').trim(),
+          code: 'VALIDATION_ERROR',
+        });
+      }
+
+      console.error('Platform reject institution request error:', err);
+      return res.status(500).json({
+        success: false,
+        error: 'Gagal menolak pengajuan institusi.',
+      });
+    }
+  }
+);
 
 // 1. Platform Global Stats
 app.get('/api/platform/stats', requireAuth, requireSuperAdmin, async (_req: Request, res: Response) => {
@@ -1812,24 +3281,221 @@ app.get('/api/platform/institutions', requireAuth, requireSuperAdmin, async (req
   }
 });
 
-// 3. Create Institution
-app.post('/api/platform/institutions', requireAuth, requireCsrf, requireSuperAdmin, async (req: AuthenticatedRequest, res: Response) => {
-  try {
-    const data = req.body;
-    if (!data.npsn || !data.namaResmi || !data.jenjang || !data.kabupatenKota || !data.provinsi) {
-      return res.status(400).json({ success: false, error: 'Data institusi utama wajib diisi.' });
+// 3. Create Institution - strict allowlist and mandatory initial School Admin.
+app.post(
+  '/api/platform/institutions',
+  requireAuth,
+  requireCsrf,
+  requireSuperAdmin,
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      if (!isPlainObject(req.body)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Format data institusi tidak valid.',
+        });
+      }
+
+      const body = req.body;
+      const allowedKeys = new Set([
+        'npsn',
+        'namaResmi',
+        'namaSingkat',
+        'jenjang',
+        'jenisInstitusi',
+        'kementerianDinas',
+        'alamatLengkap',
+        'kabupatenKota',
+        'provinsi',
+        'telepon',
+        'email',
+        'website',
+        'namaKepala',
+        'nipKepala',
+        'kotaTandaTangan',
+        'initialAdminUserId',
+      ]);
+
+      if (Object.keys(body).some((key) => !allowedKeys.has(key))) {
+        return res.status(400).json({
+          success: false,
+          error: 'Terdapat field pembuatan institusi yang tidak diizinkan.',
+        });
+      }
+
+      const initialAdminUserId = body.initialAdminUserId;
+
+      if (
+        typeof initialAdminUserId !== 'string' ||
+        initialAdminUserId.trim().length === 0 ||
+        initialAdminUserId.trim().length > 36
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: 'Pengguna aktif untuk School Admin pertama wajib dipilih.',
+        });
+      }
+
+      const institutionBody: Record<string, unknown> = { ...body };
+      delete institutionBody.initialAdminUserId;
+      delete institutionBody.namaKepala;
+      delete institutionBody.nipKepala;
+      delete institutionBody.kotaTandaTangan;
+
+      const validation = validateInstitutionRequestBody(institutionBody);
+
+      if (!validation.valid) {
+        return res.status(400).json({
+          success: false,
+          error: validation.error,
+        });
+      }
+
+      const namaKepalaResult = readOptionalText(
+        body,
+        'namaKepala',
+        'Nama kepala institusi',
+        255
+      );
+      if (!namaKepalaResult.valid) {
+        return res.status(400).json({
+          success: false,
+          error: namaKepalaResult.error,
+        });
+      }
+
+      const nipKepalaResult = readOptionalText(
+        body,
+        'nipKepala',
+        'NIP kepala institusi',
+        30
+      );
+      if (!nipKepalaResult.valid) {
+        return res.status(400).json({
+          success: false,
+          error: nipKepalaResult.error,
+        });
+      }
+
+      const kotaTandaTanganResult = readOptionalText(
+        body,
+        'kotaTandaTangan',
+        'Kota tanda tangan',
+        100
+      );
+      if (!kotaTandaTanganResult.valid) {
+        return res.status(400).json({
+          success: false,
+          error: kotaTandaTanganResult.error,
+        });
+      }
+
+      const data = validation.data;
+
+      const created = await platformAdminService.createInstitution({
+        npsn: data.npsn,
+        namaResmi: data.namaResmi,
+        namaSingkat: data.namaSingkat ?? undefined,
+        jenjang: data.jenjang,
+        jenisInstitusi: data.jenisInstitusi ?? undefined,
+        kementerianDinas: data.kementerianDinas ?? undefined,
+        alamatLengkap: data.alamatLengkap ?? undefined,
+        kabupatenKota: data.kabupatenKota,
+        provinsi: data.provinsi,
+        telepon: data.telepon ?? undefined,
+        email: data.email ?? undefined,
+        website: data.website ?? undefined,
+        namaKepala: namaKepalaResult.data ?? undefined,
+        nipKepala: nipKepalaResult.data ?? undefined,
+        kotaTandaTangan: kotaTandaTanganResult.data ?? undefined,
+        initialAdminUserId: initialAdminUserId.trim(),
+        actorUserId: req.user!.id,
+        ipAddress: getClientIp(req),
+      });
+
+      const safeInstitution = {
+        id: created.id,
+        npsn: created.npsn,
+        namaResmi: created.namaResmi,
+        namaSingkat: created.namaSingkat,
+        jenjang: created.jenjang,
+        jenisInstitusi: created.jenisInstitusi,
+        kementerianDinas: created.kementerianDinas,
+        alamatLengkap: created.alamatLengkap,
+        kabupatenKota: created.kabupatenKota,
+        provinsi: created.provinsi,
+        namaKepala: created.namaKepala,
+        nipKepala: created.nipKepala,
+        kotaTandaTangan: created.kotaTandaTangan,
+        createdAt: created.createdAt,
+        updatedAt: created.updatedAt,
+      };
+
+      return res.status(201).json({
+        success: true,
+        institution: safeInstitution,
+      });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : '';
+
+      if (message === 'NPSN_ALREADY_REGISTERED') {
+        return res.status(409).json({
+          success: false,
+          error: 'NPSN sudah terdaftar.',
+          code: message,
+        });
+      }
+
+      const prismaError = err as {
+        code?: unknown;
+        meta?: { target?: unknown };
+      };
+
+      const uniqueTarget = prismaError.meta?.target;
+      const isNpsnUniqueConflict =
+        prismaError.code === 'P2002' &&
+        (
+          (Array.isArray(uniqueTarget) &&
+            uniqueTarget.includes('npsn')) ||
+          (typeof uniqueTarget === 'string' &&
+            uniqueTarget.toLowerCase().includes('npsn'))
+        );
+
+      if (isNpsnUniqueConflict) {
+        return res.status(409).json({
+          success: false,
+          error: 'NPSN sudah terdaftar.',
+          code: 'NPSN_ALREADY_REGISTERED',
+        });
+      }
+
+      if (message === 'INITIAL_ADMIN_NOT_ACTIVE') {
+        return res.status(409).json({
+          success: false,
+          error: 'Pengguna yang dipilih sebagai School Admin tidak aktif atau tidak ditemukan.',
+          code: message,
+        });
+      }
+
+      if (
+        message === 'PLATFORM_ACTOR_NOT_ACTIVE' ||
+        message === 'SUPER_ADMIN_REQUIRED'
+      ) {
+        return res.status(403).json({
+          success: false,
+          error: 'Aktor tidak memiliki otorisasi untuk membuat institusi.',
+          code: message,
+        });
+      }
+
+      console.error('Platform create institution error:', err);
+      return res.status(500).json({
+        success: false,
+        error: 'Gagal membuat institusi baru.',
+      });
     }
-    const created = await platformAdminService.createInstitution({
-      ...data,
-      actorUserId: req.user!.id,
-      ipAddress: getClientIp(req),
-    });
-    return res.status(201).json({ success: true, institution: created });
-  } catch (err: any) {
-    console.error('Platform create institution error:', err);
-    return res.status(400).json({ success: false, error: err.message || 'Gagal membuat institusi baru' });
   }
-});
+);
 
 // 4. Get Institution Detail
 app.get('/api/platform/institutions/:id', requireAuth, requireSuperAdmin, async (req: Request, res: Response) => {
@@ -1838,13 +3504,49 @@ app.get('/api/platform/institutions/:id', requireAuth, requireSuperAdmin, async 
     const id = req.params.id;
     const institution = await prisma.institution.findUnique({
       where: { id },
-      include: {
+      select: {
+        id: true,
+        npsn: true,
+        namaResmi: true,
+        namaSingkat: true,
+        jenjang: true,
+        jenisInstitusi: true,
+        kementerianDinas: true,
+        alamatLengkap: true,
+        kelurahanDesa: true,
+        kecamatan: true,
+        kabupatenKota: true,
+        provinsi: true,
+        kodePos: true,
+        telepon: true,
+        email: true,
+        website: true,
+        logoUrl: true,
+        namaKepala: true,
+        nipKepala: true,
+        kotaTandaTangan: true,
+        createdAt: true,
+        updatedAt: true,
         memberships: {
-          include: {
-            user: { select: { id: true, namaLengkap: true, email: true, nip: true } },
+          select: {
+            id: true,
+            role: true,
+            status: true,
+            joinedAt: true,
+            user: {
+              select: {
+                id: true,
+                namaLengkap: true,
+                email: true,
+                nip: true,
+                nuptk: true,
+              },
+            },
           },
         },
-        _count: { select: { projects: true } },
+        _count: {
+          select: { projects: true },
+        },
       },
     });
 
@@ -1863,12 +3565,125 @@ app.get('/api/platform/institutions/:id', requireAuth, requireSuperAdmin, async 
 app.put('/api/platform/institutions/:id', requireAuth, requireCsrf, requireSuperAdmin, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const id = req.params.id;
-    const data = req.body;
-    const updated = await platformAdminService.updateInstitution(id, data, req.user!.id, getClientIp(req));
-    return res.json({ success: true, institution: updated });
+    const body = req.body;
+
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return res.status(400).json({ success: false, error: 'Format data institusi tidak valid.' });
+    }
+
+    const fieldRules = {
+      namaResmi: { maxLength: 255, nullable: false },
+      namaSingkat: { maxLength: 100, nullable: false },
+      jenjang: { maxLength: 20, nullable: false },
+      alamatLengkap: { maxLength: 10000, nullable: false },
+      namaKepala: { maxLength: 255, nullable: true },
+      nipKepala: { maxLength: 30, nullable: true },
+      kotaTandaTangan: { maxLength: 100, nullable: true },
+      telepon: { maxLength: 50, nullable: true },
+      email: { maxLength: 255, nullable: true },
+      website: { maxLength: 255, nullable: true },
+    } as const;
+
+    const keys = Object.keys(body);
+    if (keys.length === 0) {
+      return res.status(400).json({ success: false, error: 'Tidak ada data yang diperbarui.' });
+    }
+
+    const updateData: Record<string, string | null> = {};
+
+    for (const key of keys) {
+      if (!Object.prototype.hasOwnProperty.call(fieldRules, key)) {
+        return res.status(400).json({
+          success: false,
+          error: `Field '${key}' tidak diizinkan untuk diperbarui.`,
+        });
+      }
+
+      const rule = fieldRules[key as keyof typeof fieldRules];
+      const value = body[key];
+
+      if (value === null && rule.nullable) {
+        updateData[key] = null;
+        continue;
+      }
+
+      if (typeof value !== 'string') {
+        return res.status(400).json({
+          success: false,
+          error: `Field '${key}' harus berupa teks${rule.nullable ? ' atau null' : ''}.`,
+        });
+      }
+
+      const normalized = value.trim();
+
+      if (!rule.nullable && normalized.length === 0) {
+        return res.status(400).json({
+          success: false,
+          error: `Field '${key}' tidak boleh kosong.`,
+        });
+      }
+
+      if (normalized.length > rule.maxLength) {
+        return res.status(400).json({
+          success: false,
+          error: `Field '${key}' melebihi batas ${rule.maxLength} karakter.`,
+        });
+      }
+
+      if (key === 'email' && normalized !== '' &&
+          !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized)) {
+        return res.status(400).json({
+          success: false,
+          error: 'Format email institusi tidak valid.',
+        });
+      }
+
+      updateData[key] = normalized === '' && rule.nullable ? null : normalized;
+    }
+
+    const updated = await platformAdminService.updateInstitution(
+      id,
+      updateData as Parameters<typeof platformAdminService.updateInstitution>[1],
+      req.user!.id,
+      getClientIp(req)
+    );
+
+    const safeInstitution = {
+      id: updated.id,
+      npsn: updated.npsn,
+      namaResmi: updated.namaResmi,
+      namaSingkat: updated.namaSingkat,
+      jenjang: updated.jenjang,
+      jenisInstitusi: updated.jenisInstitusi,
+      kementerianDinas: updated.kementerianDinas,
+      alamatLengkap: updated.alamatLengkap,
+      kabupatenKota: updated.kabupatenKota,
+      provinsi: updated.provinsi,
+      telepon: updated.telepon,
+      email: updated.email,
+      website: updated.website,
+      namaKepala: updated.namaKepala,
+      nipKepala: updated.nipKepala,
+      kotaTandaTangan: updated.kotaTandaTangan,
+      createdAt: updated.createdAt,
+      updatedAt: updated.updatedAt,
+    };
+
+    return res.json({
+      success: true,
+      institution: safeInstitution,
+    });
   } catch (err: any) {
     console.error('Platform update institution error:', err);
-    return res.status(400).json({ success: false, error: err.message || 'Gagal memperbarui institusi' });
+
+    if (err instanceof Error && err.message === 'Institusi tidak ditemukan.') {
+      return res.status(404).json({ success: false, error: 'Institusi tidak ditemukan.' });
+    }
+
+    return res.status(500).json({
+      success: false,
+      error: 'Gagal memperbarui institusi.',
+    });
   }
 });
 
@@ -1894,13 +3709,41 @@ app.get('/api/platform/users/:id', requireAuth, requireSuperAdmin, async (req: R
     const id = req.params.id;
     const user = await prisma.user.findUnique({
       where: { id },
-      include: {
+      select: {
+        id: true,
+        email: true,
+        namaLengkap: true,
+        gelarDepan: true,
+        gelarBelakang: true,
+        nip: true,
+        nuptk: true,
+        nomorTelepon: true,
+        fotoProfilUrl: true,
+        preferensiMataPelajaran: true,
+        isActive: true,
+        createdAt: true,
+        updatedAt: true,
         memberships: {
-          include: {
-            institution: { select: { id: true, namaResmi: true, namaSingkat: true, npsn: true } },
+          select: {
+            id: true,
+            role: true,
+            status: true,
+            joinedAt: true,
+            institution: {
+              select: {
+                id: true,
+                namaResmi: true,
+                namaSingkat: true,
+                npsn: true,
+                kabupatenKota: true,
+                provinsi: true,
+              },
+            },
           },
         },
-        _count: { select: { projects: true } },
+        _count: {
+          select: { projects: true },
+        },
       },
     });
 
@@ -1908,8 +3751,7 @@ app.get('/api/platform/users/:id', requireAuth, requireSuperAdmin, async (req: R
       return res.status(404).json({ success: false, error: 'Pengguna tidak ditemukan' });
     }
 
-    const { passwordHash: _, ...safeUser } = user;
-    return res.json({ success: true, user: safeUser });
+    return res.json({ success: true, user });
   } catch (err: any) {
     console.error('Platform get user detail error:', err);
     return res.status(500).json({ success: false, error: 'Gagal memuat profil pengguna' });
@@ -1953,12 +3795,23 @@ app.get('/api/platform/memberships', requireAuth, requireSuperAdmin, async (req:
 // 10. Update Membership Role & Status (Platform-wide)
 app.post('/api/platform/memberships/update-role', requireAuth, requireCsrf, requireSuperAdmin, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { userId, institutionId, newRole, newStatus } = req.body;
-    if (!userId || !institutionId) {
-      return res.status(400).json({ success: false, error: 'userId dan institutionId wajib disertakan.' });
+    const validation = validateMembershipUpdateBody(req.body, 'userId');
+
+    if (!validation.valid) {
+      return res.status(400).json({
+        success: false,
+        error: validation.error,
+      });
     }
 
-    await platformAdminService.updateMembership(userId, institutionId, newRole, newStatus, req.user!.id, getClientIp(req));
+    await platformAdminService.updateMembership(
+      validation.data.userId,
+      validation.data.institutionId,
+      validation.data.newRole,
+      validation.data.newStatus,
+      req.user!.id,
+      getClientIp(req)
+    );
     return res.json({ success: true, message: 'Keanggotaan berhasil diperbarui.' });
   } catch (err: any) {
     console.error('Platform update membership error:', err);
@@ -1987,67 +3840,242 @@ app.get('/api/platform/audit-logs', requireAuth, requireSuperAdmin, async (req: 
 });
 
 
-// Setup Vite middleware in dev or serve static files in production
-async function startServer() {
-  const isProd = process.env.NODE_ENV === 'production';
+// Generator JSON parser errors: return safe API responses before Vite/static middleware.
+app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
+  if (req.path !== '/api/generate-document') return next(err);
 
-  if (!isProd) {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    // Robust static directory resolution for source execution vs compiled bundle (dist/server.js)
-    const staticDir = fs.existsSync(path.resolve(__dirname, 'index.html'))
-      ? __dirname
-      : path.resolve(__dirname, 'dist');
+  const error = err && typeof err === 'object'
+    ? err as { status?: unknown; statusCode?: unknown; type?: unknown; code?: unknown }
+    : {};
+  const status = error.status ?? error.statusCode;
 
-    app.use(express.static(staticDir));
-    app.get('*', (_req: Request, res: Response) => {
-      res.sendFile(path.resolve(staticDir, 'index.html'));
+  if (status === 413 || error.code === 'GENERATOR_PAYLOAD_TOO_LARGE' || error.type === 'entity.too.large') {
+    return res.status(413).json({
+      success: false,
+      code: 'GENERATOR_PAYLOAD_TOO_LARGE',
+      error: 'Ukuran data permintaan generator melebihi batas 2 MB.',
     });
   }
 
-  const server = app.listen(PORT, () => {
-    console.log(`EduTaktis SaaS Server listening on ${typeof PORT === 'string' ? PORT : `http://localhost:${PORT}`}`);
-  });
+  if (status === 400 || error.type === 'entity.parse.failed') {
+    return res.status(400).json({
+      success: false,
+      code: 'INVALID_JSON',
+      error: 'Format JSON permintaan tidak valid.',
+    });
+  }
 
-  // Phusion Passenger & Node.js Process Safety Handlers
-  process.on('uncaughtException', (err) => {
-    console.error('CRITICAL UNCAUGHT EXCEPTION:', err);
-  });
+  return next(err);
+});
 
-  process.on('unhandledRejection', (reason) => {
-    console.error('UNHANDLED PROMISE REJECTION:', reason);
-  });
+// Setup Vite middleware in dev or serve static files in production
+async function startServer() {
+  validateSecurityConfiguration();
+  validateGeneratorQuotaSecret();
+  const isProd = process.env.NODE_ENV === 'production';
+
+  const { checkDatabaseConnection, prisma } = await import('./src/db/prisma.js');
+
+  let viteServer: import('vite').ViteDevServer | undefined;
+  let server: ReturnType<typeof app.listen> | undefined;
+
+  // Startup is transactional with respect to acquired runtime resources:
+  // if any initialization step fails, release everything already created.
+  try {
+    const databaseStatus = await checkDatabaseConnection();
+
+    if (!databaseStatus.connected) {
+      throw new Error(
+        `Database readiness check failed: ${databaseStatus.message}`
+      );
+    }
+
+    console.log('Database readiness check passed.');
+
+    if (!isProd) {
+      const { createServer: createViteServer } = await import('vite');
+
+      viteServer = await createViteServer({
+        server: { middlewareMode: true },
+        appType: 'spa',
+      });
+
+      app.use(viteServer.middlewares);
+    } else {
+      const staticDir = path.resolve(__dirname, 'dist');
+
+      app.use(express.static(staticDir));
+      app.get('*', (_req: Request, res: Response) => {
+        res.sendFile(path.resolve(staticDir, 'index.html'));
+      });
+    }
+
+    // Wait for the actual listening event. app.listen() alone does not
+    // guarantee that the operating system accepted the requested port.
+    server = app.listen(PORT);
+
+    await new Promise<void>((resolve, reject) => {
+      const activeServer = server!;
+
+      const onListening = () => {
+        activeServer.off('error', onError);
+        resolve();
+      };
+
+      const onError = (error: Error) => {
+        activeServer.off('listening', onListening);
+        reject(error);
+      };
+
+      activeServer.once('listening', onListening);
+      activeServer.once('error', onError);
+    });
+
+    console.log(
+      `EduTaktis SaaS Server listening on ${
+        typeof PORT === 'string' ? PORT : `http://localhost:${PORT}`
+      }`
+    );
+  } catch (startupError) {
+    console.error('FATAL: EduTaktis startup failed. Cleaning up resources.');
+
+    if (server?.listening) {
+      server.closeAllConnections();
+
+      await new Promise<void>((resolve) => {
+        server!.close(() => resolve());
+      }).catch((error) => {
+        console.error('Startup HTTP cleanup failed:', error);
+      });
+    }
+
+    if (viteServer) {
+      try {
+        await viteServer.close();
+        console.log('Startup cleanup: Vite server closed.');
+      } catch (error) {
+        console.error('Startup Vite cleanup failed:', error);
+      }
+    }
+
+    try {
+      await prisma.$disconnect();
+      console.log('Startup cleanup: Prisma disconnected.');
+    } catch (error) {
+      console.error('Startup Prisma cleanup failed:', error);
+    }
+
+    throw startupError;
+  }
+
+  if (!server) {
+    throw new Error('HTTP server was not initialized.');
+  }
 
   let isShuttingDown = false;
-  const gracefulShutdown = (signal: string) => {
-    if (isShuttingDown) return;
-    isShuttingDown = true;
-    console.log(`Received ${signal}. Shutting down HTTP server gracefully...`);
+  let shutdownExitCode = 0;
 
-    const timeout = setTimeout(() => {
-      console.error('Graceful shutdown timeout reached (5s). Forcing process exit.');
-      process.exit(1);
-    }, 5000);
-    if (timeout.unref) timeout.unref();
-
-    server.close(async () => {
-      try {
-        const { prisma } = await import('./src/db/prisma.js');
-        await prisma.$disconnect();
-      } catch {
-        // ignore
+  const gracefulShutdown = (reason: string, requestedExitCode = 0): void => {
+    if (isShuttingDown) {
+      if (requestedExitCode !== 0) {
+        shutdownExitCode = 1;
       }
-      process.exit(0);
+      return;
+    }
+
+    isShuttingDown = true;
+    shutdownExitCode = requestedExitCode;
+
+    console.log(`Shutdown initiated: ${reason}`);
+
+    const shutdownTimeout = setTimeout(() => {
+      console.error(
+        'CRITICAL: Graceful shutdown exceeded 10 seconds. Forcing process exit.'
+      );
+
+      server!.closeAllConnections();
+      process.exit(1);
+    }, 10_000);
+
+    void (async () => {
+      let shutdownFailed = false;
+
+      const httpClosed = new Promise<void>((resolve, reject) => {
+        server!.close((error) => {
+          if (error) reject(error);
+          else resolve();
+        });
+      });
+
+      server!.closeIdleConnections();
+
+      if (viteServer) {
+        try {
+          await viteServer.close();
+          console.log('Vite server closed.');
+        } catch (error) {
+          shutdownFailed = true;
+          console.error('Failed to close Vite server:', error);
+        }
+      }
+
+      try {
+        await httpClosed;
+        console.log('HTTP server closed.');
+      } catch (error) {
+        shutdownFailed = true;
+        console.error('Failed to close HTTP server:', error);
+      }
+
+      try {
+        await prisma.$disconnect();
+        console.log('Prisma disconnected.');
+      } catch (error) {
+        shutdownFailed = true;
+        console.error('Failed to disconnect Prisma:', error);
+      }
+
+      clearTimeout(shutdownTimeout);
+
+      const finalExitCode =
+        shutdownFailed || shutdownExitCode !== 0 ? 1 : 0;
+
+      console.log(`Shutdown completed with exit code ${finalExitCode}.`);
+      process.exit(finalExitCode);
+    })().catch((error: unknown) => {
+      console.error('CRITICAL: Unexpected graceful shutdown failure:', error);
+      clearTimeout(shutdownTimeout);
+      process.exit(1);
     });
   };
 
-  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+  // Handle HTTP server errors occurring after successful startup.
+  server.on('error', (error: Error) => {
+    console.error('CRITICAL HTTP SERVER ERROR:', error);
+    gracefulShutdown('httpServerError', 1);
+  });
+
+  process.on('uncaughtException', (error: Error) => {
+    console.error('CRITICAL UNCAUGHT EXCEPTION:', error);
+    gracefulShutdown('uncaughtException', 1);
+  });
+
+  process.on('unhandledRejection', (reason: unknown) => {
+    console.error('CRITICAL UNHANDLED PROMISE REJECTION:', reason);
+    gracefulShutdown('unhandledRejection', 1);
+  });
+
+  process.on('SIGTERM', () => {
+    gracefulShutdown('SIGTERM', 0);
+  });
+
+  process.on('SIGINT', () => {
+    gracefulShutdown('SIGINT', 0);
+  });
 }
 
-startServer();
+startServer().catch((err: unknown) => {
+  const message = err instanceof Error ? err.message : 'Unknown startup error';
+  console.error('FATAL: EduTaktis startup aborted:', message);
+  process.exitCode = 1;
+});

@@ -23,8 +23,8 @@ Aplikasi EduTaktis tetap menggunakan stack pengembangan yang ada:
 - **SSL**: HTTPS wajib untuk autentikasi sesi dan keamanan.
 
 ## 5. Kebutuhan Deployment
-- **Build**: `npm run build` (menghasilkan `dist/server.js` dan aset frontend).
-- **Start**: `node dist/server.js` (Membutuhkan persistent runtime).
+- **Build**: `npm run build` (menghasilkan `server.js` dan aset frontend).
+- **Start**: `node server.js` (Membutuhkan persistent runtime).
 - **Environment**: `DATABASE_URL`, `SESSION_SECRET`, `CSRF_SECRET`, `GEMINI_API_KEY`, `PORT`.
 
 ## 6. Risiko dan Keterbatasan Shared Hosting

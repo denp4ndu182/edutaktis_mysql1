@@ -365,14 +365,14 @@ export const MasterInputView: React.FC<MasterInputViewProps> = ({
                     </p>
                     {tenantContext && (
                       <span className="text-[10px] font-extrabold bg-teal-100 text-teal-800 px-2.5 py-0.5 rounded-full border border-teal-300">
-                        {tenantContext.currentInstitution.namaSingkat}
+                        {tenantContext.currentInstitution?.namaSingkat || 'Belum Terhubung'}
                       </span>
                     )}
                   </div>
                   <p className="text-[11px] text-slate-600 mt-1">
                     Guru: <strong>{tenantContext ? `${tenantContext.currentUser.namaLengkap}${tenantContext.currentUser.gelarBelakang ? `, ${tenantContext.currentUser.gelarBelakang}` : ''}` : userProfile?.namaGuru || 'Belum Diatur'}</strong>
                     {' • '}
-                    Institusi: <strong>{tenantContext ? tenantContext.currentInstitution.namaResmi : userProfile?.namaMadrasah || 'Belum Diatur'}</strong>
+                    Institusi: <strong>{tenantContext?.currentInstitution?.namaResmi || userProfile?.namaMadrasah || 'Belum Terhubung / Belum Diatur'}</strong>
                   </p>
                   <p className="text-[10px] text-slate-500 mt-0.5">
                     Klik tombol di samping untuk menyelaraskan isian di bawah dengan data profil aktif saat ini.
